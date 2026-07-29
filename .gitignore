@@ -1,0 +1,20 @@
+# 输出文件
+AI后期剪辑提成一组*.xlsx
+AI后期剪辑提成一组*.html
+
+# 敏感数据 —— 含真实人员姓名，严禁提交
+config.json
+一组AI项目.xlsx
+AI后期剪辑提成一组最新.xlsx
+AI后期剪辑提成一组模板.xlsx
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.tmp
