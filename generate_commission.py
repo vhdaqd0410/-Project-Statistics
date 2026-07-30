@@ -20,13 +20,20 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from copy import copy
 
+# 强制 stdout 使用 UTF-8，避免 Windows GBK 编码报错（仅在直接运行时）
+if __name__ == '__main__' or (len(sys.argv) >= 2 and sys.stdout.encoding != 'utf-8'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 # ===================== 路径 =====================
 try:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     SCRIPT_DIR = os.getcwd()
 
-# 支持命令行参数：python generate_commission.py [项目文件] [模板文件]
+# 支持命令行参数：python generate_commission.py [项目文件] [模板文件] [输出目录]
 if len(sys.argv) >= 2:
     PROJECT_FILE = sys.argv[1]
 else:
@@ -39,12 +46,18 @@ else:
     if not os.path.exists(TEMPLATE_FILE):
         TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'AI后期剪辑提成一组最新.xlsx')
 
+# 输出目录：命令行第3参数 > 默认脚本目录
+if len(sys.argv) >= 4:
+    OUTPUT_DIR = sys.argv[3]
+else:
+    OUTPUT_DIR = SCRIPT_DIR
+
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
 
 # ===================== 从模板提取月份 =====================
 
 def get_month_from_template(template_path):
-    """从模板表头 '后期剪辑部2026年07月提成表' 提取中文月份，如 '七月'"""
+    """从模板表头提取中文月份和完整日期字符串，如 ('七月', '2026年07月')"""
     CN_MONTHS = ['', '一月','二月','三月','四月','五月','六月',
                  '七月','八月','九月','十月','十一月','十二月']
     try:
@@ -54,14 +67,15 @@ def get_month_from_template(template_path):
         wb.close()
         m = re.search(r'(\d+)年(\d+)月', str(title))
         if m:
-            month_num = int(m.group(2))
-            return CN_MONTHS[month_num] if 1 <= month_num <= 12 else '当月'
+            year, month_num = int(m.group(1)), int(m.group(2))
+            cn = CN_MONTHS[month_num] if 1 <= month_num <= 12 else '当月'
+            return cn, f'{year}年{month_num:02d}月'
     except Exception:
         pass
-    return '当月'
+    return '当月', '当月'
 
-OUTPUT_MONTH = get_month_from_template(TEMPLATE_FILE)
-OUTPUT_FILE = os.path.join(SCRIPT_DIR, f'AI后期剪辑提成一组{OUTPUT_MONTH}.xlsx')
+OUTPUT_MONTH, TEMPLATE_DATE = get_month_from_template(TEMPLATE_FILE)
+OUTPUT_FILE = os.path.join(OUTPUT_DIR, f'AI后期剪辑提成一组{OUTPUT_MONTH}.xlsx')
 
 # ===================== 加载配置 =====================
 
@@ -90,6 +104,8 @@ def normalize_role(role_str):
         return '二卡剪辑'
     if '助理' in s:
         return '剪辑助理'
+    if '小组长' in s:
+        return '一卡剪辑'   # 小组长和一卡计算方式一样
     if '组长' in s:
         return '剪辑组长'
     return '一卡剪辑'  # 默认
@@ -196,13 +212,15 @@ def parse_person_assignment(text):
     return None
 
 
-def parse_delivery_date(date_str):
+def parse_delivery_date(date_str, default_year=None):
     if not date_str:
         return None
     date_str = clean(date_str)
     m = re.search(r'(\d+)\.(\d+)', date_str)
     if m:
-        return datetime.date(2026, int(m.group(1)), int(m.group(2)))
+        month, day = int(m.group(1)), int(m.group(2))
+        year = default_year or datetime.date.today().year
+        return datetime.date(year, month, day)
     return None
 
 
@@ -521,17 +539,14 @@ def generate_excel(records, commission_data, template_path, output_path):
                             data_font, center_align, center_wrap, full_border)
 
     ws.freeze_panes = 'A4'
-
-    # ---- 自动调整行高和列宽 ----
     _auto_fit_sheet(ws, data_start, last_row)
+
+    # ---- 生成统计简报 (Sheet2) ----
+    generate_summary_sheet(wb, sorted_records, commission_data)
 
     wb.save(output_path)
     print(f"✅ 已生成: {output_path}")
     print(f"   数据: 第{data_start}行 ~ 第{last_row}行 ({len(sorted_records)}条)")
-
-    # ---- 生成统计简报 (Sheet2) + HTML仪表盘 ----
-    generate_summary_sheet(wb, sorted_records, commission_data)
-    wb.save(output_path)
 
     html_path = generate_html_dashboard(sorted_records, commission_data, output_path)
 
@@ -548,7 +563,7 @@ def generate_excel(records, commission_data, template_path, output_path):
         except Exception:
             pass
 
-    return output_path
+    return output_path, html_path
 
 
 def _auto_fit_sheet(ws, data_start, last_row):
@@ -701,7 +716,7 @@ def generate_summary_sheet(wb, records, commission_data):
 
     # ---------- 标题 ----------
     ws2.merge_cells('A1:H1')
-    ws2.cell(1, 1, '后期剪辑部 · 2026年07月 · 月度统计简报').font = title_font
+    ws2.cell(1, 1, f'后期剪辑部 · {TEMPLATE_DATE} · 月度统计简报').font = title_font
     ws2.cell(1, 1).alignment = ca; ws2.row_dimensions[1].height = 36
     ws2.merge_cells('A2:H2')
     ws2.cell(2, 1, '剪辑一组').font = note_font
@@ -886,7 +901,7 @@ def generate_html_dashboard(records, commission_data, excel_path):
     html = f'''<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>剪辑一组 · 2026年07月 · 月度统计</title>
+<title>剪辑一组 · {TEMPLATE_DATE} · 月度统计</title>
 <style>
 *{{margin:0;padding:0;box-sizing:border-box}}
 body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#f0f4f8;color:#2c3e50}}
@@ -927,7 +942,7 @@ tr:hover td{{background:#f8fafc}}.tl{{text-align:left}}
 .lg .d{{width:12px;height:12px;border-radius:3px;display:inline-block}}
 </style></head>
 <body>
-<div class="hd"><h1>🎬 后期剪辑部 · 2026年07月 · 月度统计仪表盘</h1>
+<div class="hd"><h1>🎬 后期剪辑部 · {TEMPLATE_DATE} · 月度统计仪表盘</h1>
 <p>剪辑一组 | 生成日期：2026-07-29 | {total_people}人 · {total_projects}个项目 · 总提成 {total_comm_all:,} 元</p></div>
 <div class="ct">
 <div class="cds">
@@ -1011,7 +1026,9 @@ def main():
     if missing:
         print(f"\n❌ 找不到: {', '.join(missing)}")
         print(f"   请确保这些文件与 generate_commission.py 在同一目录。")
-        input("\n按任意键退出...")
+        if len(sys.argv) < 2:
+            input("\n按任意键退出...")
+        return
 
     print(f"\n📖 数据源: {os.path.basename(PROJECT_FILE)}")
     print(f"📋 模板:   {os.path.basename(TEMPLATE_FILE)}")
@@ -1019,13 +1036,20 @@ def main():
     print(f"   角色: 一卡{cfg['rules']['一卡剪辑']['基准集数']}集 | 二卡/助理{cfg['rules']['二卡剪辑']['基准集数']}集 | 组长无限制")
 
     # 读取和解析
-    df = pd.read_excel(PROJECT_FILE, header=None)
+    try:
+        df = pd.read_excel(PROJECT_FILE, header=None)
+    except Exception as e:
+        print(f"❌ 无法读取项目数据文件: {e}")
+        if len(sys.argv) < 2:
+            input("\n按任意键退出...")
+        return
     print("🔍 解析数据中...")
     records, group_pids = parse_projects(df)
     print(f"   共 {len(records)} 条记录")
     if not records:
-        print("⚠️  未解析到任何有效记录，请检查 一组AI项目.xlsx 的数据格式。")
-        input("\n按任意键退出...")
+        print("⚠️  未解析到任何有效记录，请检查项目数据文件的格式。")
+        if len(sys.argv) < 2:
+            input("\n按任意键退出...")
         return
 
     # 统计全局项目数
@@ -1045,11 +1069,16 @@ def main():
     print_summary(records, commission_data)
 
     # 生成
-    final_path = generate_excel(records, commission_data, TEMPLATE_FILE, OUTPUT_FILE)
+    final_path, html_path = generate_excel(records, commission_data, TEMPLATE_FILE, OUTPUT_FILE)
 
+    # 输出文件路径供 GUI 读取
+    print(f"OUTPUT_EXCEL={final_path}")
+    print(f"OUTPUT_HTML={html_path}")
     print(f"\n🎉 完成！")
     print()
-    input("按任意键退出...")
+    # 如果是从 GUI 调用的（传了命令行参数），不要阻塞等待输入
+    if len(sys.argv) < 2:
+        input("按任意键退出...")
 
 
 if __name__ == '__main__':
