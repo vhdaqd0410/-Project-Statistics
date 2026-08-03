@@ -34,21 +34,32 @@ except NameError:
     SCRIPT_DIR = os.getcwd()
 
 # 支持命令行参数：python generate_commission.py [项目文件] [模板文件] [输出目录]
-if len(sys.argv) >= 2:
-    PROJECT_FILE = sys.argv[1]
+# 可选：--overtime-file 本次生成使用的超时标记 JSON 文件。
+CLI_ARGS = sys.argv[1:]
+OVERTIME_FILE = None
+if '--overtime-file' in CLI_ARGS:
+    overtime_index = CLI_ARGS.index('--overtime-file')
+    try:
+        OVERTIME_FILE = CLI_ARGS[overtime_index + 1]
+    except IndexError:
+        raise ValueError('--overtime-file 需要提供文件路径')
+    del CLI_ARGS[overtime_index:overtime_index + 2]
+
+if len(CLI_ARGS) >= 1:
+    PROJECT_FILE = CLI_ARGS[0]
 else:
     PROJECT_FILE = os.path.join(SCRIPT_DIR, '一组AI项目.xlsx')
 
-if len(sys.argv) >= 3:
-    TEMPLATE_FILE = sys.argv[2]
+if len(CLI_ARGS) >= 2:
+    TEMPLATE_FILE = CLI_ARGS[1]
 else:
     TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'AI后期剪辑提成一组模板.xlsx')
     if not os.path.exists(TEMPLATE_FILE):
         TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'AI后期剪辑提成一组最新.xlsx')
 
 # 输出目录：命令行第3参数 > 默认脚本目录
-if len(sys.argv) >= 4:
-    OUTPUT_DIR = sys.argv[3]
+if len(CLI_ARGS) >= 3:
+    OUTPUT_DIR = CLI_ARGS[2]
 else:
     OUTPUT_DIR = SCRIPT_DIR
 
@@ -75,22 +86,34 @@ def get_month_from_template(template_path):
     return '当月', '当月'
 
 OUTPUT_MONTH, TEMPLATE_DATE = get_month_from_template(TEMPLATE_FILE)
+template_year_match = re.match(r'(\d{4})年', TEMPLATE_DATE)
+TEMPLATE_YEAR = int(template_year_match.group(1)) if template_year_match else None
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, f'AI后期剪辑提成一组{OUTPUT_MONTH}.xlsx')
 
 # ===================== 加载配置 =====================
 
 def load_config():
-    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-        return json.load(f)
+    """加载并校验配置，且保证所有已配置人员都会进入输出顺序。"""
+    from config_loader import load_config as load_validated_config
+    return load_validated_config(CONFIG_FILE).to_dict()
 
-cfg = load_config()
-ROLE_MAP = cfg['人员角色']       # name -> "一卡剪辑"|"二卡剪辑"|"剪辑组长"
-RULES = cfg['rules']            # role -> {基准集数, 每集单价, ...}
-GROUPS = cfg['小组']            # group -> {组长, 成员列表}
-NAME_ORDER = cfg['人员排序']    # 输出顺序
 
-# 导出常用映射
-ALL_NAMES = list(ROLE_MAP.keys())
+def set_config(config):
+    """注入配置并同步派生映射，供 CLI 与 GUI 复用。"""
+    global cfg, ROLE_MAP, RULES, GROUPS, NAME_ORDER, ALL_NAMES
+    cfg = config
+    ROLE_MAP = cfg['人员角色']
+    RULES = cfg['rules']
+    GROUPS = cfg.get('小组', {})
+    configured_order = cfg.get('人员排序', [])
+    NAME_ORDER = list(dict.fromkeys(
+        [name for name in configured_order if name in ROLE_MAP]
+        + [name for name in ROLE_MAP if name not in configured_order]
+    ))
+    ALL_NAMES = list(ROLE_MAP.keys())
+
+
+set_config(load_config())
 
 def normalize_role(role_str):
     """容错：将用户输入的角色名规范化为标准名"""
@@ -163,9 +186,11 @@ def clean_project_name(name):
 def parse_episode_ranges(text):
     if not text:
         return [], 0
-    text = clean(text).replace('；', ';').replace('，', ',').replace('。', ',').replace('+', ',')
+    # 多分隔符统一：逗号/分号/加号/空格 -> 逗号
+    text = clean(text)
+    text = re.sub(r'[；;，,。+、\s]+', ',', text).strip(',')
     episodes = []
-    for part in re.split(r'[;,]\s*', text):
+    for part in re.split(r',', text):
         part = part.strip()
         if not part:
             continue
@@ -179,6 +204,17 @@ def parse_episode_ranges(text):
                 episodes.append(int(m.group(1)))
     result = sorted(set(episodes))
     return result, len(result)
+
+
+def parse_overtime_episodes(f_col_text):
+    """解析F列的超时集数标注，返回 set of int。支持：4,5,10-12 或 4 5 10 等多种格式"""
+    if not f_col_text:
+        return set()
+    text = clean(str(f_col_text))
+    if not text:
+        return set()
+    eps, _ = parse_episode_ranges(text)
+    return set(eps)
 
 
 def parse_person_assignment(text):
@@ -226,11 +262,29 @@ def parse_delivery_date(date_str, default_year=None):
 
 # ===================== 数据解析 =====================
 
-def parse_projects(df):
+def load_overtime_map(overtime_file):
+    """加载本次生成指定的超时集数，拒绝格式不正确的输入。"""
+    if not overtime_file:
+        return {}
+    with open(overtime_file, 'r', encoding='utf-8-sig') as f:
+        raw_map = json.load(f)
+    if not isinstance(raw_map, dict):
+        raise ValueError('超时标记文件必须是 JSON 对象，格式为 {项目ID: [集数]}')
+    result = {}
+    for pid, episodes in raw_map.items():
+        if not isinstance(episodes, list):
+            raise ValueError(f'项目 {pid} 的超时集数必须是数组')
+        result[str(pid)] = {int(ep) for ep in episodes}
+    return result
+
+
+def parse_projects(df, default_year=None, overtime_map=None):
+    """解析项目表；项目标题不完整时跳过其分配行并输出明确警告。"""
     records = []
     proj_name, proj_id, end_date = '', '', None
-    # 同时也统计每组项目ID
+    project_catalog = {}
     group_pids = {g: set() for g in GROUPS}
+    overtime_map = overtime_map or {}
 
     for i in range(len(df)):
         c0 = clean(df.iloc[i, 0])
@@ -244,28 +298,49 @@ def parse_projects(df):
             continue
 
         if c0:
-            nn = clean_project_name(c0)
-            if nn:
-                proj_name = nn
-            nid = extract_project_id(c0)
-            if nid:
-                proj_id = nid
-            if c3:
-                dt = parse_delivery_date(c3)
-                if dt:
-                    end_date = dt
+            # 新项目必须从空状态开始，不能沿用上一项目的 ID/日期。
+            proj_name = clean_project_name(c0)
+            proj_id = extract_project_id(c0)
+            end_date = parse_delivery_date(c3, default_year)
 
         if c3:
-            dt = parse_delivery_date(c3)
+            dt = parse_delivery_date(c3, default_year)
             if dt:
                 end_date = dt
 
-        if c2 and end_date:
+        if proj_id and proj_name and end_date:
+            project_catalog[proj_id] = {
+                '项目ID': proj_id,
+                'AI项目名称': proj_name,
+                '开始日期': end_date - datetime.timedelta(days=1),
+                '结束日期': end_date,
+            }
+
+        # 解析当前项目的超时集数（从 overtime_map 取）
+        overtime_set = overtime_map.get(proj_id, set())
+
+        if c2:
             res = parse_person_assignment(c2)
             if res:
                 name, detail, cnt = res
-                if cnt > 0 and name in ROLE_MAP:
+                if not proj_id or not proj_name or not end_date:
+                    print(f'⚠️ 第{i + 1}行跳过：项目 ID、名称或交付日期不完整')
+                elif name not in ROLE_MAP:
+                    print(f'⚠️ 第{i + 1}行跳过：人员 "{name}" 未配置角色')
+                elif cnt > 0:
                     start_date = end_date - datetime.timedelta(days=1)
+                    # 该人员在该项目中分到的集数
+                    person_eps = set()
+                    for ep_str in detail.split(','):
+                        if ep_str.strip().isdigit():
+                            person_eps.add(int(ep_str.strip()))
+
+                    # 该人员该项目的超时集数
+                    person_overtime = person_eps & overtime_set
+                    overtime_cnt = len(person_overtime)
+                    # 有效集数 = 普通集数 + 超时集数（每个超时集算2集，即额外+1）
+                    effective_cnt = cnt + overtime_cnt
+
                     records.append({
                         '身份证姓名': name,
                         '角色': normalize_role(ROLE_MAP[name]),
@@ -275,12 +350,44 @@ def parse_projects(df):
                         '开始日期': start_date,
                         '结束日期': end_date,
                         '完成明细': detail,
-                        '单项目数/集数': cnt,
+                        '单项目数/集数': effective_cnt,
+                        '原始集数': cnt,
+                        '超时集数': overtime_cnt,
+                        '超时明细': sorted(person_overtime),
+                        '参与剪辑': True,
                     })
                     # 统计组长所在组的项目
                     for gname, ginfo in GROUPS.items():
                         if name in ginfo['成员'] and proj_id:
                             group_pids[gname].add(proj_id)
+
+    # 剪辑组长需要在明细中覆盖全组所有项目；未参与项目只展示项目信息。
+    leader_names = [
+        name for name in NAME_ORDER
+        if normalize_role(ROLE_MAP.get(name)) == '剪辑组长'
+    ]
+    assigned_pairs = {
+        (r['身份证姓名'], r['项目ID']) for r in records
+    }
+    for leader_name in leader_names:
+        for pid, project in project_catalog.items():
+            if (leader_name, pid) in assigned_pairs:
+                continue
+            records.append({
+                '身份证姓名': leader_name,
+                '角色': '剪辑组长',
+                '项目ID': pid,
+                '项目类型': 'AI海外真人',
+                'AI项目名称': project['AI项目名称'],
+                '开始日期': project['开始日期'],
+                '结束日期': project['结束日期'],
+                '完成明细': '',
+                '单项目数/集数': 0,
+                '原始集数': 0,
+                '超时集数': 0,
+                '超时明细': [],
+                '参与剪辑': False,
+            })
 
     return records, group_pids
 
@@ -316,7 +423,7 @@ def compute_commission(records, group_pids):
         person_episodes[r['身份证姓名']] += r['单项目数/集数']
 
     # 全组去重项目数（所有小组的项目ID取并集）
-    global_pids = set()
+    global_pids = {r['项目ID'] for r in records if r.get('项目ID')}
     for pids in group_pids.values():
         global_pids |= pids
     total_unique_projects = len(global_pids)
@@ -479,12 +586,16 @@ def generate_excel(records, commission_data, template_path, output_path):
         ws.cell(ri, 10, r['完成明细'])
         ws.cell(ri, 10).font = data_font; ws.cell(ri, 10).alignment = center_align
 
-        # K: 单项目数/集数
-        ws.cell(ri, 11, r['单项目数/集数'])
-        ws.cell(ri, 11).font = data_font; ws.cell(ri, 11).alignment = center_align
+        # K: 单项目数/集数 — 有超时集数时高亮
+        episode_value = r['单项目数/集数'] if r.get('参与剪辑', True) else None
+        c = ws.cell(ri, 11, episode_value)
+        c.font = data_font; c.alignment = center_align
+        if r.get('超时集数', 0) > 0:
+            c.fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+            c.font = Font(name='宋体', size=11, bold=True)
 
         # L: 提成——组长填集数提成（集数×20），其他人留空
-        if r['角色'] == '剪辑组长':
+        if r['角色'] == '剪辑组长' and r.get('参与剪辑', True):
             ws.cell(ri, 12, r['单项目数/集数'] * 20)
         else:
             ws.cell(ri, 12).value = None
@@ -518,13 +629,13 @@ def generate_excel(records, commission_data, template_path, output_path):
     ws.cell(data_start, 1).alignment = center_align
     ws.cell(data_start, 1).border = full_border
 
-    # B/C列及M-T列：按人员合并
+    # B/C列及M-T列：按人员汇总，多条记录时再合并
     cur_person = ''
     merge_start = data_start
 
     for idx, r in enumerate(sorted_records):
         if r['身份证姓名'] != cur_person:
-            if cur_person and data_start + idx - 1 > merge_start:
+            if cur_person:
                 person_end = data_start + idx - 1
                 _apply_person_merge(ws, merge_start, person_end, cur_person,
                                     sorted_records, commission_data,
@@ -533,7 +644,7 @@ def generate_excel(records, commission_data, template_path, output_path):
             merge_start = data_start + idx
 
     # 最后一组
-    if merge_start < last_row:
+    if cur_person:
         _apply_person_merge(ws, merge_start, last_row, cur_person,
                             sorted_records, commission_data,
                             data_font, center_align, center_wrap, full_border)
@@ -611,13 +722,14 @@ def _auto_fit_sheet(ws, data_start, last_row):
 def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
                         data_font, center_align, center_wrap, full_border):
     """按人员合并B-C列和M-T列，并填入汇总数据"""
-    # B/C列合并（A列已在外部全局合并）
-    for col_letter in ['B', 'C']:
-        ws.merge_cells(f'{col_letter}{start}:{col_letter}{end}')
+    if end > start:
+        # B/C列合并（A列已在外部全局合并）
+        for col_letter in ['B', 'C']:
+            ws.merge_cells(f'{col_letter}{start}:{col_letter}{end}')
 
-    # M-T列按人员合并
-    for col_letter in ['M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T']:
-        ws.merge_cells(f'{col_letter}{start}:{col_letter}{end}')
+        # M-T列按人员合并
+        for col_letter in ['M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T']:
+            ws.merge_cells(f'{col_letter}{start}:{col_letter}{end}')
 
     cd = comm_data.get(name, {})
     total_ep = cd.get('total_episodes', 0)
@@ -666,8 +778,22 @@ def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
     # S: 奖/罚（不填，留空）
 
     # T: 备注
+    # 收集该人员的超时集数信息
+    overtime_notes = []
+    for r in sorted_records:
+        if r['身份证姓名'] == name and r.get('超时集数', 0) > 0:
+            pid = r['项目ID']
+            eps_str = ','.join(str(e) for e in sorted(r.get('超时明细', [])))
+            overtime_notes.append(f'项目{pid}: 集{eps_str}超4分(+{r["超时集数"]}集)')
+
+    remark_parts = []
     if group_bonus > 0:
-        c = ws.cell(start, 20, f"组内项目提成 +{group_bonus}")
+        remark_parts.append(f"组内项目提成 +{group_bonus}")
+    if overtime_notes:
+        remark_parts.append('；'.join(overtime_notes))
+
+    if remark_parts:
+        c = ws.cell(start, 20, '\n'.join(remark_parts))
         c.font = Font(name='宋体', size=9, bold=False)
         c.alignment = center_wrap; c.border = full_border
 
@@ -1044,7 +1170,20 @@ def main():
             input("\n按任意键退出...")
         return
     print("🔍 解析数据中...")
-    records, group_pids = parse_projects(df)
+    try:
+        overtime_map = load_overtime_map(OVERTIME_FILE)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        print(f"❌ 无法读取超时标记: {e}")
+        return
+    if overtime_map:
+        total_ot = sum(len(v) for v in overtime_map.values())
+        print(f'⏱️ 已加载本次超时集数: {total_ot}集 ({len(overtime_map)}个项目)')
+
+    records, group_pids = parse_projects(
+        df,
+        default_year=TEMPLATE_YEAR,
+        overtime_map=overtime_map,
+    )
     print(f"   共 {len(records)} 条记录")
     if not records:
         print("⚠️  未解析到任何有效记录，请检查项目数据文件的格式。")
