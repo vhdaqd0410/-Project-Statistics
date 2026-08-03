@@ -32,6 +32,7 @@ try:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     SCRIPT_DIR = os.getcwd()
+ROOT_DIR = os.path.dirname(SCRIPT_DIR)  # 项目根目录
 
 # 支持命令行参数：python generate_commission.py [项目文件] [模板文件] [输出目录]
 # 可选：--overtime-file 本次生成使用的超时标记 JSON 文件。
@@ -48,22 +49,22 @@ if '--overtime-file' in CLI_ARGS:
 if len(CLI_ARGS) >= 1:
     PROJECT_FILE = CLI_ARGS[0]
 else:
-    PROJECT_FILE = os.path.join(SCRIPT_DIR, '一组AI项目.xlsx')
+    PROJECT_FILE = os.path.join(ROOT_DIR, '一组AI项目.xlsx')
 
 if len(CLI_ARGS) >= 2:
     TEMPLATE_FILE = CLI_ARGS[1]
 else:
-    TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'AI后期剪辑提成一组模板.xlsx')
+    TEMPLATE_FILE = os.path.join(ROOT_DIR, 'AI后期剪辑提成一组模板.xlsx')
     if not os.path.exists(TEMPLATE_FILE):
-        TEMPLATE_FILE = os.path.join(SCRIPT_DIR, 'AI后期剪辑提成一组最新.xlsx')
+        TEMPLATE_FILE = os.path.join(ROOT_DIR, 'AI后期剪辑提成一组最新.xlsx')
 
 # 输出目录：命令行第3参数 > 默认脚本目录
 if len(CLI_ARGS) >= 3:
     OUTPUT_DIR = CLI_ARGS[2]
 else:
-    OUTPUT_DIR = SCRIPT_DIR
+    OUTPUT_DIR = ROOT_DIR
 
-CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
+CONFIG_FILE = os.path.join(ROOT_DIR, 'config.json')
 
 # ===================== 从模板提取月份 =====================
 

@@ -7,6 +7,29 @@ from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
 # ===================== 工具函数 =====================
 
+def parse_episode_ranges(text):
+    """解析集数范围字符串，返回 (集号列表, 数量)。支持：1-3,5,7-10 等多种格式"""
+    if not text:
+        return [], 0
+    text = str(text).strip()
+    # 多分隔符统一
+    text = re.sub(r'[；;，,。+、\s]+', ',', text).strip(',')
+    episodes = []
+    for part in re.split(r',', text):
+        part = part.strip()
+        if not part:
+            continue
+        m = re.match(r'(\d+)\s*[-–—]\s*(\d+)', part)
+        if m:
+            s, e = int(m.group(1)), int(m.group(2))
+            episodes.extend(range(min(s, e), max(s, e) + 1))
+        else:
+            m = re.match(r'(\d+)', part)
+            if m:
+                episodes.append(int(m.group(1)))
+    result = sorted(set(episodes))
+    return result, len(result)
+
 def _find_chinese_font():
     """自动查找系统中可用的中文字体"""
     candidates = [
@@ -600,6 +623,7 @@ def validate_episode_assignments(lines, selected_people, total_eps):
         },
         'summary': {name: len(episodes) for name, episodes in assignments.items()},
         'assignments': {name: _merge_episode_ranges(episodes) for name, episodes in assignments.items()},
+        'stats': {'总人数': len(assignments), '总集数': total_eps},
     }
 
 

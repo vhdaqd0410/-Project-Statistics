@@ -6,7 +6,9 @@ import subprocess, threading, os, sys, json, re, tempfile
 from datetime import datetime
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CLI_SCRIPT = os.path.join(SCRIPT_DIR, 'generate_commission.py')
+SRC_DIR = os.path.join(SCRIPT_DIR, 'src')
+sys.path.insert(0, SRC_DIR)  # 让 Python 找到 src/ 下的模块
+CLI_SCRIPT = os.path.join(SRC_DIR, 'generate_commission.py')
 CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')
 BACKUP_DIR = os.path.join(SCRIPT_DIR, 'backup')
 CARDS_DIR = os.path.join(SCRIPT_DIR, '个人绩效卡片')
@@ -29,12 +31,8 @@ except ImportError as e:
     HAS_FEATURES = False
     print(f'features import error: {e}')
 
-# 优先使用 Python 3.13（保证有 pandas/openpyxl）
-_PY313 = r'C:\Users\Admin\AppData\Local\Programs\Python\Python313\python.exe'
-if os.path.exists(_PY313):
-    PYTHON_EXE = _PY313
-else:
-    PYTHON_EXE = sys.executable
+# Python 解释器路径——优先用当前运行的解释器，兼容跨电脑
+PYTHON_EXE = sys.executable
 
 ROLES = ['一卡剪辑', '二卡剪辑', '剪辑助理', '剪辑组长', '小组长']
 ROLE_ICONS = {'一卡剪辑': '🟢', '二卡剪辑': '🔵', '剪辑助理': '🟣', '剪辑组长': '🟠', '小组长': '🟡'}
@@ -1002,63 +1000,225 @@ class App:
 
     # ============ 功能：智能分集 ============
     def _smart_assign(self):
+        try:
+            self._smart_assign_impl()
+        except Exception as e:
+            import traceback
+            msg = traceback.format_exc()
+            # 同时写文件，方便完整查看
+            with open(os.path.join(SCRIPT_DIR, '_smart_assign_error.txt'), 'w', encoding='utf-8') as f:
+                f.write(msg)
+            # 只显示前 500 字符
+            short = msg[:600] + ('...' if len(msg) > 600 else '')
+            messagebox.showerror('智能分集出错', f'完整错误已写入 _smart_assign_error.txt\n\n{short}')
+
+    def _smart_assign_impl(self):
         if not HAS_FEATURES:
             messagebox.showerror('错误', '功能模块(features.py)未找到')
             return
 
         dlg = tk.Toplevel(self.root)
         dlg.title('📐 智能分集')
-        dlg.geometry('750x680')
-        dlg.minsize(650, 550)
+        dlg.geometry('1060x700')
+        dlg.minsize(880, 520)
         dlg.configure(bg=C['bg'])
         dlg.transient(self.root); dlg.grab_set()
 
-        # 标题
-        tk.Label(dlg, text='📐 智能分集工具', font=('Microsoft YaHei', 15, 'bold'),
-                 bg=C['bg'], fg=C['text']).pack(pady=10)
-        tk.Label(dlg, text='输入项目信息，选择剪辑人员，自动按角色区间分集',
-                 font=('Microsoft YaHei', 8), bg=C['bg'], fg=C['text3']).pack()
+        # ===== 顶部标题栏 =====
+        title_bar = tk.Frame(dlg, bg=C['hdr_bg'])
+        title_bar.pack(fill='x')
+        tk.Label(title_bar, text='📐 智能分集工具', font=('Microsoft YaHei', 16, 'bold'),
+                 bg=C['hdr_bg'], fg=C['hdr_text'], padx=20, pady=10).pack(side='left')
 
-        # 项目信息卡片
-        c1 = tk.Frame(dlg, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
-        c1.pack(fill='x', padx=20, pady=6)
-        in1 = tk.Frame(c1, bg=C['card']); in1.pack(fill='x', padx=12, pady=6)
+        # ===== 左右分栏 =====
+        paned = tk.PanedWindow(dlg, orient='horizontal', bg=C['border'], sashwidth=3)
+        paned.pack(fill='both', expand=True, padx=0, pady=0)
 
-        tk.Label(in1, text='项目名称:', font=('Microsoft YaHei', 9), bg=C['card'],
-                 fg=C['text']).grid(row=0, column=0, sticky='w', pady=2)
+        # ---- 左栏：设置区 ----
+        left = tk.Frame(paned, bg=C['bg'], width=470)
+        paned.add(left, minsize=400, width=470)
+
+        # 操作按钮（永远可见）
+        btn_bar = tk.Frame(left, bg=C['bg'])
+        tk.Button(btn_bar, text='🎲 随机分集', font=('Microsoft YaHei', 13, 'bold'),
+                  bg='#e11d48', fg='white', relief='flat', cursor='hand2',
+                  padx=16, pady=10, activebackground='#be123c',
+                  command=lambda: _do_assign_common()).pack(side='left', padx=3, fill='x', expand=True)
+        tk.Button(btn_bar, text='🔄 再次随机', font=('Microsoft YaHei', 12),
+                  bg='#d97706', fg='white', relief='flat', cursor='hand2',
+                  padx=12, pady=10, activebackground='#b45309',
+                  command=lambda: _do_assign_common()).pack(side='left', padx=3, fill='x', expand=True)
+        btn_bar.pack(side='top', fill='x', padx=12, pady=(6, 4))
+
+        # 滚动区（canvas+scrollbar 子容器）
+        scroll_container = tk.Frame(left, bg=C['bg'])
+        scroll_container.pack(side='top', fill='both', expand=True)
+
+        l_canvas = tk.Canvas(scroll_container, bg=C['bg'], highlightthickness=0)
+        l_scroll = tk.Scrollbar(scroll_container, orient='vertical', command=l_canvas.yview)
+        l_canvas.configure(yscrollcommand=l_scroll.set)
+        l_scroll.pack(side='right', fill='y')
+        l_canvas.pack(side='left', fill='both', expand=True)
+
+        l_inner = tk.Frame(l_canvas, bg=C['bg'])
+        l_inner.bind('<Configure>', lambda e: l_canvas.configure(scrollregion=l_canvas.bbox('all')))
+        l_win = l_canvas.create_window((0, 0), window=l_inner, anchor='nw')
+        def _l_resize(event):
+            l_canvas.itemconfig(l_win, width=event.width)
+        l_canvas.bind('<Configure>', _l_resize)
+
+        # 滚轮
+        def _l_wheel(event):
+            l_canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        l_canvas.bind('<Enter>', lambda e: l_canvas.bind_all('<MouseWheel>', _l_wheel))
+        l_canvas.bind('<Leave>', lambda e: l_canvas.unbind_all('<MouseWheel>'))
+
+        # ① 项目信息区
+        c1 = tk.Frame(l_inner, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
+        c1.pack(fill='x', padx=10, pady=(10, 4))
+        in1 = tk.Frame(c1, bg=C['card']); in1.pack(fill='x', padx=12, pady=10)
+        tk.Label(in1, text='📋 项目信息', font=('Microsoft YaHei', 10, 'bold'),
+                 bg=C['card'], fg=C['text']).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 6))
+
+        tk.Label(in1, text='项目名称', font=('Microsoft YaHei', 9), bg=C['card'],
+                 fg=C['text2']).grid(row=1, column=0, sticky='w', pady=3)
         name_var = tk.StringVar()
-        tk.Entry(in1, textvariable=name_var, font=('Microsoft YaHei', 10), width=40,
-                 relief='solid', borderwidth=1).grid(row=0, column=1, padx=6, pady=2)
+        tk.Entry(in1, textvariable=name_var, font=('Microsoft YaHei', 10),
+                 relief='solid', borderwidth=1).grid(row=1, column=1, padx=(8, 0), pady=3, sticky='ew')
+        in1.columnconfigure(1, weight=1)
 
-        tk.Label(in1, text='总集数:', font=('Microsoft YaHei', 9), bg=C['card'],
-                 fg=C['text']).grid(row=1, column=0, sticky='w', pady=2)
-        eps_var = tk.IntVar(value=100)
+        tk.Label(in1, text='总集数', font=('Microsoft YaHei', 9), bg=C['card'],
+                 fg=C['text2']).grid(row=2, column=0, sticky='w', pady=3)
+        eps_var = tk.IntVar(value=70)
         tk.Spinbox(in1, from_=1, to=2000, textvariable=eps_var, font=('Microsoft YaHei', 10),
-                   width=8, relief='solid', borderwidth=1).grid(row=1, column=1, padx=6, pady=2, sticky='w')
+                   width=7, relief='solid', borderwidth=1).grid(row=2, column=1, padx=(8, 0), pady=3, sticky='w')
 
-        tk.Label(in1, text='一卡区间(前N集):', font=('Microsoft YaHei', 9), bg=C['card'],
-                 fg=C['text']).grid(row=2, column=0, sticky='w', pady=2)
+        tk.Label(in1, text='一卡区间(前N集)', font=('Microsoft YaHei', 9), bg=C['card'],
+                 fg=C['text2']).grid(row=3, column=0, sticky='w', pady=3)
         range_var = tk.IntVar(value=15)
         tk.Spinbox(in1, from_=1, to=500, textvariable=range_var, font=('Microsoft YaHei', 10),
-                   width=8, relief='solid', borderwidth=1).grid(row=2, column=1, padx=6, pady=2, sticky='w')
+                   width=7, relief='solid', borderwidth=1).grid(row=3, column=1, padx=(8, 0), pady=3, sticky='w')
 
-        # 人员选择卡片
-        c2 = tk.Frame(dlg, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
-        c2.pack(fill='x', padx=20, pady=2)
-        in2 = tk.Frame(c2, bg=C['card']); in2.pack(fill='x', padx=12, pady=6)
-        tk.Label(in2, text='选择剪辑人员:', font=('Microsoft YaHei', 9, 'bold'),
-                 bg=C['card'], fg=C['text']).pack(anchor='w')
+        # ② 人员选择区
+        c2 = tk.Frame(l_inner, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
+        c2.pack(fill='x', padx=10, pady=4)
+        in2 = tk.Frame(c2, bg=C['card']); in2.pack(fill='x', padx=12, pady=10)
+        hdr_row = tk.Frame(in2, bg=C['card'])
+        hdr_row.pack(fill='x', pady=(0, 4))
+        tk.Label(hdr_row, text='👥 选择剪辑人员', font=('Microsoft YaHei', 10, 'bold'),
+                 bg=C['card'], fg=C['text']).pack(side='left')
 
-        cb_frame = tk.Frame(in2, bg=C['card'])
-        cb_frame.pack(fill='x', pady=3)
+        # ---- 选人模版 ----
+        templates = self.cfg.get('personnel_templates', {})
+        template_var = tk.StringVar(value='')
+        tmpl_row = tk.Frame(in2, bg=C['card'])
+        tmpl_row.pack(fill='x', pady=(0, 6))
+
+        def _refresh_template_combo():
+            """刷新模版下拉列表"""
+            names = list(templates.keys())
+            if not names:
+                names = ['（暂无模版）']
+            tpl_combo['values'] = names
+            if template_var.get() not in names:
+                template_var.set(names[0])
+
+        tpl_combo = ttk.Combobox(tmpl_row, textvariable=template_var, values=[],
+                                  state='readonly', font=('Microsoft YaHei', 9), width=16)
+        tpl_combo.pack(side='left', padx=(0, 4))
+        _refresh_template_combo()
+
+        def _load_template():
+            name = template_var.get()
+            if not name or name.startswith('（'):
+                return
+            if name not in templates:
+                messagebox.showwarning('提示', f'模版"{name}"不存在', parent=dlg)
+                return
+            # 先清空所有勾选
+            for v in check_vars.values():
+                v.set(False)
+            # 勾选模版中的人员（跳过不存在的）
+            for nm in templates[name]:
+                if nm in check_vars:
+                    check_vars[nm].set(True)
+
+        def _save_template():
+            # 收集当前勾选
+            selected = [n for n, v in check_vars.items() if v.get()]
+            if not selected:
+                messagebox.showwarning('提示', '请先勾选至少一位剪辑人员', parent=dlg)
+                return
+            from tkinter import simpledialog
+            name = simpledialog.askstring('保存模版', '请输入模版名称：', parent=dlg)
+            if not name:
+                return
+            name = name.strip()
+            if not name:
+                return
+            if name in templates:
+                if not messagebox.askyesno('确认覆盖', f'模版"{name}"已存在，是否覆盖？', parent=dlg):
+                    return
+            templates[name] = selected
+            self.cfg['personnel_templates'] = templates
+            self._save_config()
+            _refresh_template_combo()
+            template_var.set(name)
+            self._log(f'💾 选人模版"{name}"已保存 ({len(selected)}人)')
+
+        def _delete_template():
+            name = template_var.get()
+            if not name or name.startswith('（') or name not in templates:
+                return
+            if messagebox.askyesno('确认删除', f'确定删除模版"{name}"？', parent=dlg):
+                del templates[name]
+                self.cfg['personnel_templates'] = templates
+                self._save_config()
+                _refresh_template_combo()
+                self._log(f'🗑 选人模版"{name}"已删除')
+
+        tk.Button(tmpl_row, text='📥 加载', font=('Microsoft YaHei', 8),
+                  bg=C['blue'], fg='white', relief='flat', cursor='hand2',
+                  padx=8, pady=1, command=_load_template).pack(side='left', padx=2)
+        tk.Button(tmpl_row, text='💾 保存', font=('Microsoft YaHei', 8),
+                  bg=C['green'], fg='white', relief='flat', cursor='hand2',
+                  padx=8, pady=1, command=_save_template).pack(side='left', padx=2)
+        tk.Button(tmpl_row, text='🗑 删除', font=('Microsoft YaHei', 8),
+                  bg=C['red'], fg='white', relief='flat', cursor='hand2',
+                  padx=8, pady=1, command=_delete_template).pack(side='left', padx=2)
+
+        # ---- 快捷选择 ----
+        sel_frame = tk.Frame(in2, bg=C['card'])
+        sel_frame.pack(fill='x', pady=(0, 4))
+        def _select_all():
+            for v in check_vars.values(): v.set(True)
+        def _select_none():
+            for v in check_vars.values(): v.set(False)
+        def _select_card1():
+            for n, v in check_vars.items():
+                v.set('一卡' in roles_map.get(n, '') or '小组长' in roles_map.get(n, ''))
+        def _select_card2():
+            for n, v in check_vars.items():
+                v.set('二卡' in roles_map.get(n, '') or '助理' in roles_map.get(n, '') or ('组长' in roles_map.get(n, '') and '小组长' not in roles_map.get(n, '')))
+
+        tk.Button(sel_frame, text='全选', font=('Microsoft YaHei', 9),
+                  bg=C['blue'], fg='white', relief='flat', cursor='hand2',
+                  padx=12, pady=3, command=_select_all).pack(side='left', padx=3)
+        tk.Button(sel_frame, text='全不选', font=('Microsoft YaHei', 9),
+                  bg=C['gray'], fg='white', relief='flat', cursor='hand2',
+                  padx=12, pady=3, command=_select_none).pack(side='left', padx=3)
+        tk.Button(sel_frame, text='小组长+一卡', font=('Microsoft YaHei', 9),
+                  bg='#eab308', fg='white', relief='flat', cursor='hand2',
+                  padx=12, pady=3, command=_select_card1).pack(side='left', padx=3)
+        tk.Button(sel_frame, text='二卡/助理/组长', font=('Microsoft YaHei', 9),
+                  bg='#d97706', fg='white', relief='flat', cursor='hand2',
+                  padx=12, pady=3, command=_select_card2).pack(side='left', padx=3)
 
         check_vars = {}
         roles_map = self.cfg.get('人员角色', {})
-        # 按角色排序展示
         role_order = {'小组长': 0, '一卡剪辑': 1, '二卡剪辑': 2, '剪辑助理': 3, '剪辑组长': 4}
         sorted_people = sorted(roles_map.keys(), key=lambda n: role_order.get(roles_map[n], 99))
 
-        # 分组显示
         role_labels = [
             ('小组长', '🟡', lambda r: '小组长' in r),
             ('一卡剪辑', '🟢', lambda r: '一卡' in r and '小组长' not in r),
@@ -1066,59 +1226,53 @@ class App:
             ('剪辑助理', '🟣', lambda r: '助理' in r),
             ('剪辑组长', '🟠', lambda r: '组长' in r and '小组长' not in r),
         ]
+        cb_frame = tk.Frame(in2, bg=C['card'])
+        cb_frame.pack(fill='x')
         for role_name, icon, matcher in role_labels:
             people_in_role = [n for n in sorted_people if matcher(roles_map[n])]
             if not people_in_role: continue
-            tk.Label(cb_frame, text=f'{icon} {role_name}', font=('Microsoft YaHei', 8),
-                           bg=C['card'], fg=C['text']).pack(anchor='w', pady=3)
-            sub_frame = tk.Frame(cb_frame, bg=C['card'])
-            sub_frame.pack(fill='x')
+            tk.Label(cb_frame, text=f'{icon} {role_name}', font=('Microsoft YaHei', 9, 'bold'),
+                           bg=C['card'], fg=C['text']).pack(anchor='w', pady=(8, 3))
+            # 两列网格
+            grid = tk.Frame(cb_frame, bg=C['card'])
+            grid.pack(fill='x')
+            for col in range(2):
+                grid.columnconfigure(col, weight=1)
+            row, col = 0, 0
             for nm in people_in_role:
                 v = tk.BooleanVar(value=False)
                 check_vars[nm] = v
-                tk.Checkbutton(sub_frame, text=nm, variable=v, font=('Microsoft YaHei', 8),
+                tk.Checkbutton(grid, text=nm, variable=v, font=('Microsoft YaHei', 9),
                                bg=C['card'], fg=C['text'], selectcolor=C['card'],
-                               activebackground=C['card']).pack(side='left', padx=0)
+                               activebackground=C['card'], anchor='w',
+                               padx=4, pady=2).grid(row=row, column=col, sticky='w')
+                col += 1
+                if col >= 2:
+                    col = 0
+                    row += 1
 
-        # 全选/全不选按钮
-        sel_frame = tk.Frame(in2, bg=C['card'])
-        sel_frame.pack(fill='x', pady=4)
-        def _select_all():
-            for v in check_vars.values(): v.set(True)
-        def _select_none():
-            for v in check_vars.values(): v.set(False)
-        def _select_card1():
-            for n, v in check_vars.items():
-                r = roles_map.get(n, '')
-                v.set('一卡' in r or '小组长' in r)
-        def _select_card2():
-            for n, v in check_vars.items():
-                r = roles_map.get(n, '')
-                v.set('二卡' in r or '助理' in r or ('组长' in r and '小组长' not in r))
+        # ---- 右栏：结果预览区 ----
+        right = tk.Frame(paned, bg=C['bg'])
+        paned.add(right, minsize=320)
 
-        tk.Button(sel_frame, text='全选', font=('Microsoft YaHei', 8),
+        c3 = tk.Frame(right, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
+        c3.pack(fill='both', expand=True, padx=(0, 10), pady=10)
+        c3_header = tk.Frame(c3, bg=C['accent_l'])
+        c3_header.pack(fill='x')
+        tk.Label(c3_header, text='📋 分集结果预览', font=('Microsoft YaHei', 10, 'bold'),
+                 bg=C['accent_l'], fg=C['text'], padx=14, pady=6).pack(side='left')
+        tk.Button(c3_header, text='📋 复制结果', font=('Microsoft YaHei', 8),
                   bg=C['blue'], fg='white', relief='flat', cursor='hand2',
-                  padx=10, pady=2, command=_select_all).pack(side='left', padx=0)
-        tk.Button(sel_frame, text='全不选', font=('Microsoft YaHei', 8),
-                  bg=C['gray'], fg='white', relief='flat', cursor='hand2',
-                  padx=10, pady=2, command=_select_none).pack(side='left', padx=0)
-        tk.Button(sel_frame, text='小组长+一卡', font=('Microsoft YaHei', 8),
-                  bg='#eab308', fg='white', relief='flat', cursor='hand2',
-                  padx=10, pady=2, command=_select_card1).pack(side='left', padx=0)
-        tk.Button(sel_frame, text='仅二卡/助理/组长', font=('Microsoft YaHei', 8),
-                  bg='#d97706', fg='white', relief='flat', cursor='hand2',
-                  padx=10, pady=2, command=_select_card2).pack(side='left')
+                  padx=10, pady=2,
+                  command=lambda: (
+                      dlg.clipboard_clear(),
+                      dlg.clipboard_append(result_text.get('1.0', 'end-1c')),
+                      None
+                  )).pack(side='right', padx=8, pady=4)
 
-        # 结果展示区
-        c3 = tk.Frame(dlg, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
-        c3.pack(fill='both', expand=True, padx=20, pady=4)
-        in3 = tk.Frame(c3, bg=C['card']); in3.pack(fill='both', expand=True, padx=12, pady=6)
-        tk.Label(in3, text='📋 分集结果:', font=('Microsoft YaHei', 9, 'bold'),
-                 bg=C['card'], fg=C['text']).pack(anchor='w')
-
-        result_text = tk.Text(in3, font=('Consolas', 9), bg=C['log_bg'], fg=C['log_fg'],
-                              relief='flat', padx=8, pady=6, height=6, wrap='word')
-        result_text.pack(fill='both', expand=True, pady=2)
+        result_text = tk.Text(c3, font=('Consolas', 9), bg=C['log_bg'], fg=C['log_fg'],
+                              relief='flat', padx=10, pady=8, wrap='word')
+        result_text.pack(fill='both', expand=True)
 
         # 执行函数
         last_result = [None]  # mutable container
@@ -1256,6 +1410,7 @@ class App:
                 except: pass
             except Exception as e:
                 self._log(f'⚠️ 追加项目数据失败: {e}')
+                raise  # 重新抛出，让调用方捕获并弹窗
 
         def _do_assign_common():
             """通用分集逻辑 - do_assign 和 reroll 共用"""
@@ -1296,44 +1451,215 @@ class App:
         from datetime import datetime as _dt, timedelta as _td
 
         # ===== 确认窗构建函数 =====
-        def _build_confirm_rows(confirm_dlg, selected, result, outer_frame):
-            """在 outer_frame 中为每个 selected 人员创建一行 下拉+输入框"""
-            row_widgets = []
-            for nm in selected:
-                rf = tk.Frame(outer_frame, bg=C['card'])
-                rf.pack(fill='x', pady=0)
+        def _build_row_cards(sframe, selected, result, total):
+            """每人为一张卡片：▲▼排序 + 下拉选人 + 区间标签 + Spinbox添加"""
+            rows = []  # [{name_var, ranges: [(s,e),...], frame, tag_container, ...}]
+
+            # ---- 共享工具函数 ----
+            def _refresh_tags(ri):
+                """根据 ri['ranges'] 重建标签"""
+                for w in ri['tag_container'].winfo_children():
+                    w.destroy()
+                ri['ranges'].sort()
+                if not ri['ranges']:
+                    tk.Label(ri['tag_container'], text='（暂无区间）',
+                             font=('Microsoft YaHei', 9, 'italic'),
+                             bg=C['card'], fg=C['text3']).pack(side='left')
+                    return
+                for s, e in ri['ranges']:
+                    label_text = f'{s}-{e}' if s != e else str(s)
+                    tag = tk.Frame(ri['tag_container'], bg=C['accent_l'], padx=0, pady=0)
+                    tag.pack(side='left', padx=2)
+                    tk.Label(tag, text=label_text, font=('Microsoft YaHei', 10),
+                             bg=C['accent_l'], fg=C['text'], padx=6, pady=2).pack(side='left')
+                    x_btn = tk.Label(tag, text=' ×', font=('Microsoft YaHei', 9, 'bold'),
+                                     bg=C['accent_l'], fg=C['red'], cursor='hand2',
+                                     padx=1, pady=1)
+                    x_btn.pack(side='left')
+                    ri_cap, se_cap = ri, (s, e)
+                    x_btn.bind('<Button-1>', lambda e, r=ri_cap, se=se_cap: (
+                        r['ranges'].remove(se) if se in r['ranges'] else None,
+                        _refresh_tags(r)
+                    ))
+
+            # ---- 阶段一：创建卡片UI ----
+            for i, nm in enumerate(selected):
+                card = tk.Frame(sframe, bg=C['card'],
+                                highlightthickness=1, highlightbackground=C['border'],
+                                padx=10, pady=8)
+                card.pack(fill='x', pady=3)
+
+                # 第一行：▲▼ + 姓名 + 角色
+                top_row = tk.Frame(card, bg=C['card'])
+                top_row.pack(fill='x')
+                btn_col = tk.Frame(top_row, bg=C['card'])
+                btn_col.pack(side='left', padx=(0, 6))
+
                 nv = tk.StringVar(value=nm)
-                cb = ttk.Combobox(rf, textvariable=nv, values=selected,
-                                  state='readonly', font=('Microsoft YaHei', 9), width=16)
-                cb.pack(side='left', padx=4, pady=3)
-                ranges = result['assignments'].get(nm, [])
-                parts = [f'{s}-{e}' if s != e else str(s) for s, e in ranges]
-                ev = tk.StringVar(value=', '.join(parts))
-                ent = tk.Entry(rf, textvariable=ev,
-                               font=('Consolas', 9), relief='solid', borderwidth=1)
-                ent.pack(side='left', fill='x', expand=True, padx=4, pady=3, ipady=2)
-                row_widgets.append((nv, ev, cb, ent))
-            return row_widgets
+                cb = ttk.Combobox(top_row, textvariable=nv, values=selected,
+                                  state='readonly', font=('Microsoft YaHei', 11), width=14)
+                cb.pack(side='left', padx=4)
+
+                role = roles_map.get(nm, '')
+                role_colors = {'小组长': '#fef3c7', '一卡': '#d1fae5', '二卡': '#dbeafe', '助理': '#ede9fe'}
+                rc = next((v for k, v in role_colors.items() if k in role), C['accent_l'])
+                role_short = role.replace('剪辑', '') if role else ''
+                if role_short:
+                    tk.Label(top_row, text=role_short, font=('Microsoft YaHei', 8),
+                             bg=rc, fg=C['text2'], padx=6, pady=1).pack(side='left', padx=4)
+
+                # 第二行：区间标签
+                tag_row = tk.Frame(card, bg=C['card'])
+                tag_row.pack(fill='x', pady=(6, 0))
+                tag_container = tk.Frame(tag_row, bg=C['card'])
+                tag_container.pack(side='left')
+
+                # 第三行：添加控件
+                add_row = tk.Frame(card, bg=C['card'])
+                add_row.pack(fill='x', pady=(6, 0))
+
+                raw_ranges = result['assignments'].get(nm, [])
+                ranges = list(raw_ranges)
+
+                spin_from = tk.IntVar(value=1)
+                spin_to = tk.IntVar(value=1)
+
+                ri = {
+                    'name_var': nv, 'ranges': ranges, 'frame': card,
+                    'tag_container': tag_container, 'spin_from': spin_from,
+                    'spin_to': spin_to, 'add_row': add_row, '_btn_col': btn_col,
+                }  # type: dict[str, object]
+
+                _refresh_tags(ri)
+
+                # 添加控件
+                f = tk.Frame(ri['add_row'], bg=C['card'])
+                f.pack(side='left')
+                tk.Label(f, text='添加区间：从', font=('Microsoft YaHei', 9),
+                         bg=C['card'], fg=C['text2']).pack(side='left')
+                tk.Spinbox(f, from_=1, to=total, textvariable=ri['spin_from'],
+                           font=('Microsoft YaHei', 10), width=6,
+                           relief='solid', borderwidth=1, justify='center').pack(side='left', padx=4)
+                tk.Label(f, text='到', font=('Microsoft YaHei', 9),
+                         bg=C['card'], fg=C['text2']).pack(side='left')
+                tk.Spinbox(f, from_=1, to=total, textvariable=ri['spin_to'],
+                           font=('Microsoft YaHei', 10), width=6,
+                           relief='solid', borderwidth=1, justify='center').pack(side='left', padx=4)
+
+                # 占位按钮（稍后绑定）
+                add_btn = tk.Button(f, text='添加', font=('Microsoft YaHei', 9),
+                                    bg=C['green'], fg='white', relief='flat', cursor='hand2',
+                                    padx=12, pady=2, activebackground='#15803d')
+                add_btn.pack(side='left', padx=6, pady=2)
+                ri['_add_btn'] = add_btn
+
+                rows.append(ri)
+
+            # ---- 阶段二：绑定共享的 do_add ----
+            def _do_add(ri):
+                """智能添加：自动清除本人重叠区间 + 其他所有人冲突区间"""
+                try:
+                    s = int(ri['spin_from'].get())
+                    e = int(ri['spin_to'].get())
+                except (ValueError, TypeError):
+                    return
+                if not (1 <= s <= total and 1 <= e <= total):
+                    return
+                if s > e:
+                    s, e = e, s
+                new_set = set(range(s, e + 1))
+
+                # 1. 对本人：移除所有与新区间重叠的旧区间
+                surv = []
+                for (a, b) in ri['ranges']:
+                    old_set = set(range(a, b + 1))
+                    if not (old_set & new_set):  # 无交集才保留
+                        surv.append((a, b))
+                ri['ranges'] = surv
+
+                # 2. 对其他所有人：移除与新区间重叠的部分
+                for other in rows:
+                    if other is ri:
+                        continue
+                    surv_other = []
+                    for (a, b) in other['ranges']:
+                        old_set = set(range(a, b + 1))
+                        if not (old_set & new_set):
+                            surv_other.append((a, b))
+                        else:
+                            # 有重叠，尝试切割保留不重叠部分
+                            kept = []
+                            if a < s:
+                                kept.append((a, s - 1))
+                            if b > e:
+                                kept.append((e + 1, b))
+                            # 只保留没有与新区间重叠的部分
+                            for (ka, kb) in kept:
+                                kset = set(range(ka, kb + 1))
+                                if not (kset & new_set):
+                                    surv_other.append((ka, kb))
+                    other['ranges'] = surv_other
+                    _refresh_tags(other)
+
+                # 3. 添加新区间
+                ri['ranges'].append((s, e))
+                _refresh_tags(ri)
+
+            # 绑定到所有添加按钮
+            for ri in rows:
+                ri['_add_btn'].configure(command=lambda r=ri: _do_add(r))
+
+            # ---- 阶段三：▲▼排序 ----
+            for i, ri in enumerate(rows):
+                bf = ri['_btn_col']
+                def _mk_up(idx):
+                    def _up():
+                        if idx <= 0: return
+                        a, b = rows[idx - 1], rows[idx]
+                        a['name_var'].set(b['name_var'].get()), b['name_var'].set(a['name_var'].get())
+                        a['ranges'], b['ranges'] = b['ranges'], a['ranges']
+                        _refresh_tags(a); _refresh_tags(b)
+                    return _up
+                def _mk_down(idx):
+                    def _down():
+                        if idx >= len(rows) - 1: return
+                        a, b = rows[idx], rows[idx + 1]
+                        a['name_var'].set(b['name_var'].get()), b['name_var'].set(a['name_var'].get())
+                        a['ranges'], b['ranges'] = b['ranges'], a['ranges']
+                        _refresh_tags(a); _refresh_tags(b)
+                    return _down
+
+                tk.Button(bf, text='▲', font=('Microsoft YaHei', 10, 'bold'),
+                          bg=C['blue_l'], fg=C['blue'], relief='flat', cursor='hand2',
+                          padx=6, pady=1, activebackground=C['blue'],
+                          command=_mk_up(i)).pack(side='top')
+                tk.Button(bf, text='▼', font=('Microsoft YaHei', 10, 'bold'),
+                          bg=C['blue_l'], fg=C['blue'], relief='flat', cursor='hand2',
+                          padx=6, pady=1, activebackground=C['blue'],
+                          command=_mk_down(i)).pack(side='top')
+
+            # ---- 返回 rows 及工具函数 ----
+            return rows, _do_add, _refresh_tags
 
         def _show_confirm_dialog(parent, proj_name, selected, total, result,
                                  roles_map, check_vars, last_result,
                                  result_text, eps_var, range_var):
             cdlg = tk.Toplevel(parent)
             cdlg.title('确认并修改分集结果')
-            cdlg.geometry('620x480')
-            cdlg.minsize(420, 320)
+            cdlg.geometry('880x680')
+            cdlg.minsize(600, 450)
             cdlg.configure(bg=C['bg'])
             cdlg.transient(parent)
             cdlg.grab_set()
 
             tk.Label(cdlg, text='📝 确认分集结果（可修改）',
-                     font=('Microsoft YaHei', 13, 'bold'),
-                     bg=C['bg'], fg=C['text']).pack(pady=(10, 4))
-            tk.Label(cdlg, text='下拉选人，编辑集数范围（如 1-3, 5, 7-10），确认后填入表格',
-                     font=('Microsoft YaHei', 8), bg=C['bg'], fg=C['text3']).pack()
+                     font=('Microsoft YaHei', 16, 'bold'),
+                     bg=C['bg'], fg=C['text']).pack(pady=(14, 2))
+            tk.Label(cdlg, text='▲▼ 拖拽排序  |  下拉选人  |  Spinbox 选起止 + 添加  |  × 移除区间',
+                     font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text3']).pack()
 
             outer = tk.Frame(cdlg, bg=C['border'])
-            outer.pack(fill='both', expand=True, padx=20, pady=8)
+            outer.pack(fill='both', expand=True, padx=24, pady=10)
 
             canvas = tk.Canvas(outer, bg=C['card'], highlightthickness=0)
             sbar = tk.Scrollbar(outer, orient='vertical', command=canvas.yview)
@@ -1358,41 +1684,52 @@ class App:
             # 表头
             hdr = tk.Frame(sframe, bg=C['accent_l'])
             hdr.pack(fill='x')
-            tk.Label(hdr, text='剪辑人员', font=('Microsoft YaHei', 8, 'bold'),
-                     bg=C['accent_l'], fg=C['text'], width=14, anchor='w', padx=8).pack(side='left')
-            tk.Label(hdr, text='负责集数范围', font=('Microsoft YaHei', 8, 'bold'),
-                     bg=C['accent_l'], fg=C['text'], anchor='w', padx=8).pack(side='left', fill='x', expand=True)
+            tk.Label(hdr, text='编辑人员', font=('Microsoft YaHei', 10, 'bold'),
+                     bg=C['accent_l'], fg=C['text'], width=16, anchor='w', padx=12).pack(side='left')
+            tk.Label(hdr, text='负责集数区间', font=('Microsoft YaHei', 10, 'bold'),
+                     bg=C['accent_l'], fg=C['text'], anchor='w', padx=12).pack(side='left', fill='x', expand=True)
 
-            row_widgets = _build_confirm_rows(cdlg, selected, result, sframe)
+            row_widgets, rows_do_add, rows_refresh = _build_row_cards(sframe, selected, result, total)
 
             tk.Label(sframe, text=f'共 {total} 集 | {len(selected)} 人',
-                     font=('Microsoft YaHei', 8), bg=C['card'], fg=C['text3'], anchor='e').pack(fill='x', padx=8, pady=(4, 2))
+                     font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2'], anchor='e').pack(fill='x', padx=12, pady=(6, 2))
 
             def _confirm():
                 try:
                     lines = []
                     seen = {}
-                    for nv, ev, cb, ent in row_widgets:
-                        nm = nv.get().strip()
-                        eps = ev.get().strip()
-                        if not nm or not eps:
+                    for ri in row_widgets:
+                        nm = ri['name_var'].get().strip()
+                        if not nm:
                             continue
                         if nm in seen:
                             raise ValueError(f'"{nm}" 出现多次，请合并为一行')
                         seen[nm] = True
-                        lines.append(f'{nm}：{eps}')
+                        # 将 ranges 列表转为文本格式
+                        parts = [f'{s}-{e}' if s != e else str(s) for s, e in sorted(ri['ranges'])]
+                        if not parts:
+                            raise ValueError(f'"{nm}" 没有分配任何集数区间')
+                        eps_text = ', '.join(parts)
+                        lines.append(f'{nm}：{eps_text}')
                     if not lines:
                         messagebox.showwarning('提示', '没有有效的分配行', parent=cdlg)
                         return
                     validated = validate_episode_assignments('\n'.join(lines), selected, total)
-                    canvas.unbind_all('<MouseWheel>')
-                    cdlg.destroy()
-                    last_result[0] = validated
+
+                    # 先写入，再关窗，确保异常能被捕获并展示
                     _display_result(validated, proj_name)
                     _save_txt(proj_name, validated)
                     _append_to_project(proj_name, validated, selected, total)
+
+                    canvas.unbind_all('<MouseWheel>')
+                    cdlg.destroy()
+                    last_result[0] = validated
                 except ValueError as e:
                     messagebox.showerror('校验失败', str(e), parent=cdlg)
+                except Exception as e:
+                    import traceback
+                    msg = f'{type(e).__name__}: {e}\n\n{traceback.format_exc()}'
+                    messagebox.showerror('确认失败', msg, parent=cdlg)
 
             def _on_destroy():
                 canvas.unbind_all('<MouseWheel>')
@@ -1401,43 +1738,38 @@ class App:
             cdlg.protocol('WM_DELETE_WINDOW', _on_destroy)
 
             btn_f2 = tk.Frame(cdlg, bg=C['bg'])
-            btn_f2.pack(fill='x', padx=20, pady=(0, 12))
-            tk.Button(btn_f2, text='✅ 确认填入', font=('Microsoft YaHei', 11, 'bold'),
+            btn_f2.pack(fill='x', padx=24, pady=(0, 14))
+            tk.Button(btn_f2, text='✅ 确认填入表格', font=('Microsoft YaHei', 12, 'bold'),
                       bg='#16a34a', fg='white', relief='flat', cursor='hand2',
-                      padx=20, pady=6, activebackground='#15803d',
-                      command=_confirm).pack(side='left', padx=4)
-            tk.Button(btn_f2, text='🔄 再随机一次', font=('Microsoft YaHei', 11),
+                      padx=24, pady=8, activebackground='#15803d',
+                      command=_confirm).pack(side='left', padx=6)
+            tk.Button(btn_f2, text='🔄 再次随机', font=('Microsoft YaHei', 11),
                       bg=C['amber'], fg='white', relief='flat', cursor='hand2',
-                      padx=14, pady=6, activebackground='#b45309',
+                      padx=16, pady=8, activebackground='#b45309',
                       command=lambda: [_on_destroy(),
-                                       _do_assign_common()]).pack(side='left', padx=4)
+                                       _do_assign_common()]).pack(side='left', padx=6)
+
+            def _reset_all():
+                """清空所有区间，重新从原始算法结果加载"""
+                fresh = smart_episode_assignment(total, selected, roles_map, range_var.get())
+                last_result[0] = fresh
+                for ri in row_widgets:
+                    nm = ri['name_var'].get()
+                    if nm in fresh['assignments']:
+                        ri['ranges'] = list(fresh['assignments'][nm])
+                    else:
+                        ri['ranges'] = []
+                    rows_refresh(ri)
+                _display_result(fresh, proj_name)
+
+            tk.Button(btn_f2, text='🗑 重置区间', font=('Microsoft YaHei', 10),
+                      bg=C['red'], fg='white', relief='flat', cursor='hand2',
+                      padx=12, pady=8, activebackground='#dc2626',
+                      command=_reset_all).pack(side='left', padx=6)
+
             tk.Button(btn_f2, text='❌ 取消', font=('Microsoft YaHei', 11),
                       bg=C['gray'], fg='white', relief='flat', cursor='hand2',
-                      padx=16, pady=6, command=_on_destroy).pack(side='right', padx=4)
-
-        def copy_result():
-            text = result_text.get('1.0', 'end-1c')
-            if text.strip():
-                dlg.clipboard_clear()
-                dlg.clipboard_append(text)
-                messagebox.showinfo('已复制', '分集结果已复制到剪贴板，可直接粘贴到项目Excel。')
-
-        btn_f = tk.Frame(dlg, bg=C['bg'])
-        btn_f.pack(fill='x', padx=20, pady=0)
-        tk.Button(btn_f, text='🎲 随机分集', font=('Microsoft YaHei', 12, 'bold'),
-                  bg='#e11d48', fg='white', relief='flat', cursor='hand2',
-                  padx=24, pady=8, activebackground='#be123c',
-                  command=_do_assign_common).pack(side='left', padx=0)
-        tk.Button(btn_f, text='🎲 再次随机', font=('Microsoft YaHei', 11),
-                  bg='#d97706', fg='white', relief='flat', cursor='hand2',
-                  padx=16, pady=8, activebackground='#b45309',
-                  command=_do_assign_common).pack(side='left', padx=0)
-        tk.Button(btn_f, text='📋 复制结果', font=('Microsoft YaHei', 11),
-                  bg=C['blue'], fg='white', relief='flat', cursor='hand2',
-                  padx=16, pady=8, command=copy_result).pack(side='left', padx=0)
-        tk.Button(btn_f, text='关闭', font=('Microsoft YaHei', 11),
-                  bg=C['gray'], fg='white', relief='flat', cursor='hand2',
-                  padx=16, pady=8, command=dlg.destroy).pack(side='right')
+                      padx=16, pady=8, command=_on_destroy).pack(side='right', padx=6)
 
     def _check_duplicates(self):
         self._log('🔍 正在检查项目去重...')
