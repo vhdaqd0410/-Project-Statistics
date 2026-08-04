@@ -1,9 +1,13 @@
 import json
 import tempfile
 import unittest
+import sys, os
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
+
+# 确保能找到 src/ 下的模块
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'src'))
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
@@ -104,7 +108,8 @@ class RegressionTests(unittest.TestCase):
 
             sheet = load_workbook(output).active
             self.assertEqual(sheet["M4"].value, 80)
-            self.assertEqual(sheet["R4"].value, 200)
+            # R列现在是算式文本（一卡：超额(80-70)×20=200）
+            self.assertEqual(sheet["R4"].value, "(80-70)×20=200")
 
     def test_overtime_is_explicit_input(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", encoding="utf-8", delete=False) as f:

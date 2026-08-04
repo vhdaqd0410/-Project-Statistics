@@ -8,6 +8,13 @@ If Not fso.FileExists(guiPath) Then
     WScript.Quit 1
 End If
 
-' 自动检测：优先 pythonw（无控制台），其次 python
-cmd = "pythonw.exe """ & guiPath & """"
+' 优先 Python 3.13（已安装全部依赖），其次 PATH 中的 pythonw
+py313 = "C:\Users\Admin\AppData\Local\Programs\Python\Python313\pythonw.exe"
+If fso.FileExists(py313) Then
+    pyPath = py313
+Else
+    pyPath = "pythonw.exe"
+End If
+
+cmd = """" & pyPath & """ """ & guiPath & """"
 WshShell.Run cmd, 0, False

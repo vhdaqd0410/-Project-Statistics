@@ -148,6 +148,38 @@ def _parse_config_dict(raw: dict, source_label: str = "") -> AppConfig:
             person_order.append(name)
             seen_names.add(name)
 
+    # --- 解析 选人模版 ---
+    raw_templates = raw.get("personnel_templates", {})
+    if not isinstance(raw_templates, dict):
+        errors.append(f"  personnel_templates: 应为对象(dict)，当前为 {type(raw_templates).__name__}")
+        raw_templates = {}
+
+    personnel_templates: dict[str, list[str]] = {}
+    for tname, tlist in raw_templates.items():
+        if not isinstance(tlist, list):
+            errors.append(f"  personnel_templates.{tname}: 应为数组(list)，当前为 {type(tlist).__name__}")
+            continue
+        personnel_templates[str(tname)] = [str(n) for n in tlist]
+
+    # --- 解析 GUI 使用设置 ---
+    raw_app_settings = raw.get("app_settings", {})
+    if not isinstance(raw_app_settings, dict):
+        errors.append(f"  app_settings: 应为对象(dict)，当前为 {type(raw_app_settings).__name__}")
+        raw_app_settings = {}
+
+    # --- 解析主题、月度目标、项目模板、版本等扩展字段 ---
+    theme = raw.get("theme", "light")
+    if theme not in ("light", "dark"):
+        theme = "light"
+    raw_monthly_goals = raw.get("monthly_goals", {})
+    if not isinstance(raw_monthly_goals, dict):
+        raw_monthly_goals = {}
+    raw_project_templates = raw.get("project_templates", {})
+    if not isinstance(raw_project_templates, dict):
+        raw_project_templates = {}
+    version = str(raw.get("version", "1.0.0"))
+    update_check = bool(raw.get("update_check", True))
+
     # --- 汇总错误 ---
     if errors:
         error_msg = f"配置校验失败{label}:\n" + "\n".join(errors)
@@ -158,6 +190,13 @@ def _parse_config_dict(raw: dict, source_label: str = "") -> AppConfig:
         rules=rules,
         groups=groups,
         person_order=person_order,
+        personnel_templates=personnel_templates,
+        app_settings=dict(raw_app_settings),
+        theme=theme,
+        monthly_goals=dict(raw_monthly_goals),
+        project_templates=dict(raw_project_templates),
+        version=version,
+        update_check=update_check,
     )
 
 

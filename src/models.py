@@ -64,6 +64,13 @@ class AppConfig:
     rules: dict[str, QuotaRule] = field(default_factory=dict)    # role -> QuotaRule
     groups: dict[str, GroupInfo] = field(default_factory=dict)   # group_name -> GroupInfo
     person_order: list[str] = field(default_factory=list)         # 输出排序
+    personnel_templates: dict[str, list[str]] = field(default_factory=dict)  # 选人模版
+    app_settings: dict[str, Any] = field(default_factory=dict)    # GUI 上次使用设置
+    theme: str = "light"                                        # 界面主题 light/dark
+    monthly_goals: dict[str, Any] = field(default_factory=dict)  # 月度目标
+    project_templates: dict[str, Any] = field(default_factory=dict)  # 智能分集项目模板
+    version: str = "1.0.0"                                        # 当前版本号
+    update_check: bool = True                                     # 是否检查更新
 
     @property
     def all_names(self) -> list[str]:
@@ -98,6 +105,15 @@ class AppConfig:
             rules=rules,
             groups=groups,
             person_order=list(data.get("人员排序", [])),
+            personnel_templates={
+                str(k): list(v) for k, v in data.get("personnel_templates", {}).items()
+            },
+            app_settings=dict(data.get("app_settings", {})),
+            theme=data.get("theme", "light"),
+            monthly_goals=dict(data.get("monthly_goals", {})),
+            project_templates=dict(data.get("project_templates", {})),
+            version=data.get("version", "1.0.0"),
+            update_check=bool(data.get("update_check", True)),
         )
 
     def to_dict(self) -> dict:
@@ -127,6 +143,13 @@ class AppConfig:
             "人员角色": dict(self.person_roles),
             "小组": groups_out,
             "人员排序": list(self.person_order),
+            "personnel_templates": dict(self.personnel_templates),
+            "app_settings": dict(self.app_settings),
+            "theme": self.theme,
+            "monthly_goals": dict(self.monthly_goals),
+            "project_templates": dict(self.project_templates),
+            "version": self.version,
+            "update_check": self.update_check,
         }
 
 

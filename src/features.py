@@ -4,31 +4,11 @@ import os, re, json, shutil, datetime, html as html_mod, random
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 
+# 共享工具函数
+from utils import parse_episode_ranges, parse_overtime_episodes, merge_episode_ranges
+
 
 # ===================== 工具函数 =====================
-
-def parse_episode_ranges(text):
-    """解析集数范围字符串，返回 (集号列表, 数量)。支持：1-3,5,7-10 等多种格式"""
-    if not text:
-        return [], 0
-    text = str(text).strip()
-    # 多分隔符统一
-    text = re.sub(r'[；;，,。+、\s]+', ',', text).strip(',')
-    episodes = []
-    for part in re.split(r',', text):
-        part = part.strip()
-        if not part:
-            continue
-        m = re.match(r'(\d+)\s*[-–—]\s*(\d+)', part)
-        if m:
-            s, e = int(m.group(1)), int(m.group(2))
-            episodes.extend(range(min(s, e), max(s, e) + 1))
-        else:
-            m = re.match(r'(\d+)', part)
-            if m:
-                episodes.append(int(m.group(1)))
-    result = sorted(set(episodes))
-    return result, len(result)
 
 def _find_chinese_font():
     """自动查找系统中可用的中文字体"""
@@ -47,31 +27,6 @@ def _find_chinese_font():
 def _escape_html(text):
     """HTML转义"""
     return html_mod.escape(str(text))
-
-
-def parse_overtime_episodes(text):
-    """解析超时集数输入，支持任意分隔符：1,3,5-8 或 1 3 5-8 或 1;3;5-8"""
-    if not text:
-        return set()
-    text = str(text).strip()
-    if not text:
-        return set()
-    # 统一分隔符：逗号/分号/加号/空格/顿号 → 逗号
-    text = re.sub(r'[；;，,。+、\s]+', ',', text).strip(',')
-    episodes = set()
-    for part in re.split(r',', text):
-        part = part.strip()
-        if not part:
-            continue
-        # 范围: "5-8"
-        m = re.match(r'(\d+)\s*[-–—]\s*(\d+)', part)
-        if m:
-            s, e = int(m.group(1)), int(m.group(2))
-            episodes.update(range(min(s, e), max(s, e) + 1))
-        # 单个数字
-        elif re.match(r'^\d+$', part):
-            episodes.add(int(part))
-    return episodes
 
 
 # ===================== 1. 生成下月模板 =====================
@@ -506,7 +461,7 @@ def smart_episode_assignment(total_eps, selected_people, role_map, leader_prefix
 
     # ===== ① 小组长前段 =====
     if leaders:
-        hc = _weighted_counts(leader_head, leaders, {p: 1 for p in leaders})
+        hc = _weighted_counts(leader_head, leaders)
         for p in leaders:
             emit(p, hc[p])
 
@@ -526,7 +481,7 @@ def smart_episode_assignment(total_eps, selected_people, role_map, leader_prefix
 
     if mid_ppl and cursor <= mid_end:
         mid_space = mid_end - cursor + 1
-        mq = _weighted_counts(mid_space, mid_ppl, {p: 1 for p in mid_ppl})
+        mq = _weighted_counts(mid_space, mid_ppl)
         for p in mid_ppl:
             emit(p, mq[p])
             if cursor > mid_end:
@@ -536,14 +491,14 @@ def smart_episode_assignment(total_eps, selected_people, role_map, leader_prefix
     if card1 and cursor < total_eps - leader_tail + 1:
         pre = total_eps - leader_tail - cursor + 1
         if pre > 0:
-            ct = _weighted_counts(pre, card1, {p: 1 for p in card1})
+            ct = _weighted_counts(pre, card1)
             for p in card1:
                 emit(p, ct[p])
 
     # ===== ⑤ 小组长尾段 =====
     if leaders and cursor <= total_eps:
         tail_eps = total_eps - cursor + 1
-        tc = _weighted_counts(tail_eps, leaders, {p: 1 for p in leaders})
+        tc = _weighted_counts(tail_eps, leaders)
         for p in leaders:
             emit(p, tc[p])
 
@@ -564,15 +519,17 @@ def smart_episode_assignment(total_eps, selected_people, role_map, leader_prefix
     return formatted
 
 
-def _weighted_counts(total, people, weights):
-    """按最大余数法分配整数集数，确保总数准确。"""
+def _weighted_counts(total, people):
+    """按最大余数法均匀分配整数集数，确保总和恰好等于 total。"""
     if not people or total <= 0:
         return {person: 0 for person in people}
-    total_weight = sum(weights[person] for person in people)
-    raw = {person: total * weights[person] / total_weight for person in people}
-    counts = {person: int(raw[person]) for person in people}
-    remainder = total - sum(counts.values())
-    for person in sorted(people, key=lambda p: raw[p] - counts[p], reverse=True)[:remainder]:
+    n = len(people)
+    # 均分 + 余数按剩余最大小数分配
+    base = total // n
+    raw_frac = {person: total / n - base for person in people}
+    counts = {person: base for person in people}
+    remainder = total - base * n
+    for person in sorted(people, key=lambda p: raw_frac[p], reverse=True)[:remainder]:
         counts[person] += 1
     return counts
 
@@ -618,45 +575,20 @@ def validate_episode_assignments(lines, selected_people, total_eps):
     return {
         'formatted': {
             name: '；'.join(f'{start}-{end}' if start != end else str(start)
-                             for start, end in _merge_episode_ranges(episodes))
+                             for start, end in merge_episode_ranges(episodes))
             for name, episodes in assignments.items()
         },
         'summary': {name: len(episodes) for name, episodes in assignments.items()},
-        'assignments': {name: _merge_episode_ranges(episodes) for name, episodes in assignments.items()},
+        'assignments': {name: merge_episode_ranges(episodes) for name, episodes in assignments.items()},
         'stats': {'总人数': len(assignments), '总集数': total_eps},
     }
 
 
-def _merge_episode_ranges(episodes):
-    episodes = sorted(set(episodes))
-    if not episodes:
-        return []
-    result, start, end = [], episodes[0], episodes[0]
-    for episode in episodes[1:]:
-        if episode == end + 1:
-            end = episode
-        else:
-            result.append((start, end))
-            start = end = episode
-    result.append((start, end))
-    return result
-
-
 def _format_result(result, leader, card1_only, card2_people, big_leader,
                    selected_people, n_first, n_mid, n_tail, card1_range=15):
-    def merge_ranges(eps):
-        if not eps: return []
-        eps = sorted(set(eps))
-        ranges, s, e = [], eps[0], eps[0]
-        for ep in eps[1:]:
-            if ep == e + 1: e = ep
-            else: ranges.append((s, e)); s = e = ep
-        ranges.append((s, e))
-        return ranges
-
     assignments, fmt, summary = {}, {}, {}
     for name in result:
-        r = merge_ranges(result[name])
+        r = merge_episode_ranges(result[name])
         assignments[name] = r
         summary[name] = len(result[name])
         fmt[name] = '；'.join(f'{s}-{e}' if s != e else str(s) for s, e in r)
@@ -1204,3 +1136,60 @@ a{{color:#60a5fa;text-decoration:none}}a:hover{{text-decoration:underline;color:
             # 端口被占用，尝试下一个
             return start_web_server(serve_dir, port + 1)
         raise
+
+
+# ===================== 多格式导出 =====================
+
+def export_to_csv(records, commission_data, output_dir):
+    """导出人员提成 CSV 和项目明细 CSV。返回生成的文件路径列表。"""
+    import csv
+    os.makedirs(output_dir, exist_ok=True)
+    created = []
+
+    # 人员提成 CSV
+    person_csv = os.path.join(output_dir, '人员提成.csv')
+    with open(person_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        w = csv.writer(f)
+        w.writerow(['姓名', '角色', '总集数', '基准', '绩效', '超额/组奖', '缺集扣除', '提成合计'])
+        for name in commission_data:
+            cd = commission_data.get(name, {})
+            w.writerow([
+                name, cd.get('role', ''), cd.get('total_episodes', 0),
+                cd.get('quota', 0), cd.get('is_complete', ''),
+                cd.get('overtime_bonus', 0) + cd.get('group_project_bonus', 0),
+                cd.get('shortage_penalty', 0), cd.get('total_commission', 0),
+            ])
+    created.append(person_csv)
+
+    # 项目明细 CSV
+    proj_csv = os.path.join(output_dir, '项目明细.csv')
+    with open(proj_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        w = csv.writer(f)
+        w.writerow(['人员', '角色', '项目ID', '项目名称', '开始日期', '结束日期', '完成明细', '集数'])
+        for r in records:
+            w.writerow([
+                r.get('身份证姓名', ''), r.get('角色', ''), r.get('项目ID', ''),
+                r.get('AI项目名称', ''), r.get('开始日期', ''), r.get('结束日期', ''),
+                r.get('完成明细', ''), r.get('单项目数/集数', 0),
+            ])
+    created.append(proj_csv)
+    return created
+
+
+def export_to_json(records, commission_data, output_dir):
+    """导出结构化 JSON（含 records、commission、summary），美化格式。"""
+    os.makedirs(output_dir, exist_ok=True)
+    json_path = os.path.join(output_dir, '提成数据.json')
+    summary = {
+        'total_people': len(commission_data),
+        'total_commission': sum(cd.get('total_commission', 0) for cd in commission_data.values()),
+        'total_episodes': sum(r.get('单项目数/集数', 0) for r in records),
+    }
+    data = {
+        'summary': summary,
+        'records': records,
+        'commission': commission_data,
+    }
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    return json_path

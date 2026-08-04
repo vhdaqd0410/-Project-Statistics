@@ -86,6 +86,32 @@ def get_month_from_template(template_path):
         pass
     return '当月', '当月'
 
+
+def get_month_from_data(df):
+    """从项目数据文件提取真实月份。
+
+    数据文件第一行通常是"八月份"这样的中文月份标题；
+    若识别到，返回 (中文月份, 月份数字)，否则返回 (None, None)。
+    """
+    # 中文月份（第1个是空串占位，索引=月份数字）
+    CN_MONTHS = ['', '一月','二月','三月','四月','五月','六月',
+                 '七月','八月','九月','十月','十一月','十二月']
+    # 带"份"的标题形式（数据文件里常见）
+    CN_MONTHS_FEN = ['', '一月份','二月份','三月份','四月份','五月份','六月份',
+                     '七月份','八月份','九月份','十月份','十一月份','十二月份']
+    try:
+        for i in range(min(3, len(df))):
+            cell = clean(df.iloc[i, 0])
+            if cell in CN_MONTHS_FEN:
+                month_num = CN_MONTHS_FEN.index(cell)
+                return CN_MONTHS[month_num], month_num
+            if cell in CN_MONTHS:
+                month_num = CN_MONTHS.index(cell)
+                return CN_MONTHS[month_num], month_num
+    except Exception:
+        pass
+    return None, None
+
 OUTPUT_MONTH, TEMPLATE_DATE = get_month_from_template(TEMPLATE_FILE)
 template_year_match = re.match(r'(\d{4})年', TEMPLATE_DATE)
 TEMPLATE_YEAR = int(template_year_match.group(1)) if template_year_match else None
@@ -187,8 +213,10 @@ def clean_project_name(name):
 def parse_episode_ranges(text):
     if not text:
         return [], 0
-    # 多分隔符统一：逗号/分号/加号/空格 -> 逗号
     text = clean(text)
+    if not text:
+        return [], 0
+    # 多分隔符统一：逗号/分号/加号/空格 -> 逗号
     text = re.sub(r'[；;，,。+、\s]+', ',', text).strip(',')
     episodes = []
     for part in re.split(r',', text):
@@ -443,6 +471,7 @@ def compute_commission(records, group_pids):
                 'quota': 0, 'is_complete': '是',
                 'overtime_bonus': 0, 'shortage_penalty': 0,
                 'group_project_bonus': group_bonus,
+                'project_count': total_unique_projects,
                 'total_commission': total_commission,
                 'desc': rule['提成构成描述'],
             }
@@ -455,7 +484,7 @@ def compute_commission(records, group_pids):
                     'total_episodes': total, 'role': role, 'rule': rule,
                     'quota': quota, 'is_complete': '是',
                     'overtime_bonus': overtime, 'shortage_penalty': 0,
-                    'group_project_bonus': 0,
+                    'group_project_bonus': 0, 'project_count': 0,
                     'total_commission': overtime,
                     'desc': rule['提成构成描述'],
                 }
@@ -465,7 +494,7 @@ def compute_commission(records, group_pids):
                     'total_episodes': total, 'role': role, 'rule': rule,
                     'quota': quota, 'is_complete': '否',
                     'overtime_bonus': 0, 'shortage_penalty': shortage,
-                    'group_project_bonus': 0,
+                    'group_project_bonus': 0, 'project_count': 0,
                     'total_commission': -shortage,
                     'desc': rule['提成构成描述'],
                 }
@@ -490,6 +519,15 @@ def generate_excel(records, commission_data, template_path, output_path):
 
     wb = load_workbook(output_path)
     ws = wb.active
+
+    # 更新 Excel 主标题月份为数据文件真实月份（如 '后期剪辑部2026年07月提成表' → 八月）
+    try:
+        title_cell = ws.cell(1, 2)
+        if title_cell.value:
+            title_cell.value = re.sub(
+                r'\d+年\d+月', TEMPLATE_DATE, str(title_cell.value))
+    except Exception:
+        pass
 
     data_font = copy(ws.cell(4, 2).font) if ws.cell(4, 2).font else Font(name='宋体', size=11)
     date_fmt = 'yyyy"年"m"月"d"日";@'
@@ -710,6 +748,9 @@ def _auto_fit_sheet(ws, data_start, last_row):
     # Q列（提成构成）适当宽
     ws.column_dimensions['Q'].width = min(max(col_max_len.get(17, 20) + 4, 24), 45)
 
+    # R列（提成合计，算式文本）适当宽
+    ws.column_dimensions['R'].width = min(max(col_max_len.get(18, 20) + 4, 24), 40)
+
     # 数据行高：统一 20pt
     for r in range(data_start, last_row + 1):
         ws.row_dimensions[r].height = 20
@@ -741,9 +782,15 @@ def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
     total_comm = cd.get('total_commission', 0)
     desc = cd.get('desc', '')
     role = cd.get('role', '')
+    rule = cd.get('rule', {})
+    project_count = cd.get('project_count', 0)
 
-    # M: 总项目数/集数
-    c = ws.cell(start, 13, total_ep)
+    # M: 总项目数/集数（组长填"项目数/集数"，其他人填集数）
+    if role == '剪辑组长':
+        m_value = f'{project_count}/{total_ep}'
+    else:
+        m_value = total_ep
+    c = ws.cell(start, 13, m_value)
     c.font = data_font; c.alignment = center_align; c.border = full_border
 
     # N: 绩效是否完成——组长永远"是"
@@ -758,7 +805,7 @@ def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
     # P: 任务超额提成金额
     if role == '剪辑组长':
         # 组长P列填集数提成（集数×20）
-        episode_money = total_ep * cd['rule'].get('每集单价', 20)
+        episode_money = total_ep * rule.get('每集单价', 20)
         c = ws.cell(start, 16, episode_money)
         c.font = data_font; c.alignment = center_align; c.border = full_border
     else:
@@ -772,8 +819,20 @@ def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
     c.font = Font(name='宋体', size=8, bold=False)
     c.alignment = center_wrap; c.border = full_border
 
-    # R: 提成合计
-    c = ws.cell(start, 18, total_comm)
+    # R: 提成合计（写清计算过程：算式=结果）
+    if role == '剪辑组长':
+        eps_price = rule.get('每集单价', 20)
+        proj_price = rule.get('组内每部提成', 100)
+        r_value = f'{total_ep}×{eps_price}+{project_count}×{proj_price}={total_comm}'
+    else:
+        quota = rule.get('基准集数', 120)
+        if total_ep >= quota:
+            over_price = rule.get('超额每集', 20)
+            r_value = f'({total_ep}-{quota})×{over_price}={total_comm}'
+        else:
+            short_price = rule.get('缺集每集扣', 50)
+            r_value = f'-({quota}-{total_ep})×{short_price}={total_comm}'
+    c = ws.cell(start, 18, r_value)
     c.font = data_font; c.alignment = center_align; c.border = full_border
 
     # S: 奖/罚（不填，留空）
@@ -1011,6 +1070,7 @@ def generate_html_dashboard(records, commission_data, excel_path):
         rank_bars += f'<div class="br"><span class="rn">{medal}</span><span class="bl">{p["name"]}</span><div class="bt"><div class="bf" style="width:{max(pct,2)}%;background:{color};"></div></div><span class="bv" style="color:{color}">{p["total"]:,}</span></div>'
 
     # 绩效明细表
+    goals = cfg.get('monthly_goals', {}) if 'cfg' in globals() else {}
     detail_rows = ''
     for p in persons:
         cls = ' class="ld"' if p['role'] == '剪辑组长' else ''
@@ -1020,7 +1080,23 @@ def generate_html_dashboard(records, commission_data, excel_path):
         pn = f'<span class="an">-{p["penalty"]:,}</span>' if p['penalty'] else '-'
         tc = 'ap' if p['total'] > 0 else ('an' if p['total'] < 0 else '')
         qt = f'{p["quota"]}集' if p['quota'] > 0 else '无'
-        detail_rows += f'<tr{cls}><td><b>{p["name"]}</b></td><td>{p["role"]}</td><td>{p["episodes"]}</td><td>{qt}</td><td>{bd}</td><td>{ex}</td><td>{pn}</td><td class="{tc}">{p["total"]:,}</td></tr>\n'
+        # 目标进度
+        g = goals.get(p['name'], {})
+        goal_html = '-'
+        if g.get('episodes'):
+            geps = g['episodes']
+            if geps > 0:
+                gpct = min(100, int(p['episodes'] / geps * 100))
+                gcolor = '#27ae60' if gpct >= 100 else ('#e67e22' if gpct >= 80 else '#e74c3c')
+                goal_html = f'<div style="display:flex;align-items:center;gap:4px"><div style="flex:1;height:12px;background:#eef2f7;border-radius:4px"><div style="height:100%;width:{gpct}%;background:{gcolor};border-radius:4px"></div></div><span style="font-size:11px;color:{gcolor}">{p["episodes"]}/{geps}</span></div>'
+        if g.get('income') and p['total'] > 0:
+            ginc = g['income']
+            prev = goal_html
+            if ginc > 0:
+                ipct = min(100, int(p['total'] / ginc * 100))
+                icolor = '#27ae60' if ipct >= 100 else ('#e67e22' if ipct >= 80 else '#e74c3c')
+                goal_html = f'{prev}<div style="display:flex;align-items:center;gap:4px;margin-top:2px"><div style="flex:1;height:12px;background:#eef2f7;border-radius:4px"><div style="height:100%;width:{ipct}%;background:{icolor};border-radius:4px"></div></div><span style="font-size:11px;color:{icolor}">{p["total"]:,}/{ginc:,}</span></div>'
+        detail_rows += f'<tr{cls}><td><b>{p["name"]}</b></td><td>{p["role"]}</td><td>{p["episodes"]}</td><td>{qt}</td><td>{bd}</td><td>{ex}</td><td>{pn}</td><td class="{tc}">{p["total"]:,}</td><td class="tl">{goal_html}</td></tr>\n'
 
     t_ex = sum(p['extra'] for p in persons)
     t_pn = sum(p['penalty'] for p in persons)
@@ -1087,7 +1163,7 @@ tr:hover td{{background:#f8fafc}}.tl{{text-align:left}}
 <div class="pn"><h2>🏆 提成排行</h2>{rank_bars}</div>
 </div>
 <div class="pn"><h2>👥 人员绩效明细</h2><div style="overflow-x:auto"><table>
-<thead><tr><th>姓名</th><th>角色</th><th>总集数</th><th>基准</th><th>绩效</th><th>超额/组奖</th><th>缺集扣</th><th>提成合计</th></tr></thead>
+<thead><tr><th>姓名</th><th>角色</th><th>总集数</th><th>基准</th><th>绩效</th><th>超额/组奖</th><th>缺集扣</th><th>提成合计</th><th>目标进度</th></tr></thead>
 <tbody>{detail_rows}
 <tr style="font-weight:bold;background:#d6e4f0"><td>合计</td><td></td><td>{total_ep_all}</td><td></td><td></td><td>{t_ex:,}</td><td>{t_pn:,}</td><td>{total_comm_all:,}</td></tr></tbody></table></div></div>
 <div class="pn"><h2>📋 本月项目清单（{total_projects}部）</h2><div style="overflow-x:auto"><table>
@@ -1171,6 +1247,21 @@ def main():
             input("\n按任意键退出...")
         return
     print("🔍 解析数据中...")
+
+    # 用数据文件的真实月份覆盖模板月份（输出文件名/报表标题/仪表盘均以数据月份为准）
+    global OUTPUT_MONTH, TEMPLATE_DATE, TEMPLATE_YEAR, OUTPUT_FILE
+    data_cn, data_month_num = get_month_from_data(df)
+    if data_cn and data_month_num:
+        # 年份优先从模板取，否则取当前年份
+        template_year_match = re.match(r'(\d{4})年', TEMPLATE_DATE)
+        cur_year = template_year_match.group(1) if template_year_match else str(datetime.date.today().year)
+        OUTPUT_MONTH = data_cn
+        TEMPLATE_DATE = f'{cur_year}年{data_month_num:02d}月'
+        TEMPLATE_YEAR = int(cur_year)
+        OUTPUT_FILE = os.path.join(OUTPUT_DIR, f'AI后期剪辑提成一组{OUTPUT_MONTH}.xlsx')
+        print(f"📅 数据文件月份: {TEMPLATE_DATE}（已按数据月份覆盖模板）")
+    else:
+        print(f"📅 未在数据文件中识别到月份，使用模板月份: {TEMPLATE_DATE}")
     try:
         overtime_map = load_overtime_map(OVERTIME_FILE)
     except (OSError, ValueError, json.JSONDecodeError) as e:
