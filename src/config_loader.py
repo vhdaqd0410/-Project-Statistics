@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import hashlib
 from typing import Optional
 
 import constants as C
@@ -179,6 +180,10 @@ def _parse_config_dict(raw: dict, source_label: str = "") -> AppConfig:
         raw_project_templates = {}
     version = str(raw.get("version", "1.0.0"))
     update_check = bool(raw.get("update_check", True))
+    raw_favorites = raw.get("favorites", [])
+    if not isinstance(raw_favorites, list):
+        raw_favorites = []
+    favorites = [str(x) for x in raw_favorites]
 
     # --- 汇总错误 ---
     if errors:
@@ -197,6 +202,7 @@ def _parse_config_dict(raw: dict, source_label: str = "") -> AppConfig:
         project_templates=dict(raw_project_templates),
         version=version,
         update_check=update_check,
+        favorites=favorites,
     )
 
 
@@ -257,3 +263,166 @@ def load_config_or_default(config_path: str) -> AppConfig:
         print(f"⚠️ 配置加载失败: {e}", file=sys.stderr)
         print("⚠️ 使用空配置继续运行。请在 GUI 中通过「角色配置」设置。", file=sys.stderr)
         return AppConfig()
+
+
+# ===================== 多环境配置 =====================
+
+def get_env_dir(config_path):
+    """返回环境配置目录（与 config.json 同级的 environments/）"""
+    base = os.path.dirname(os.path.abspath(config_path))
+    return os.path.join(base, 'environments')
+
+
+def list_environments(config_path):
+    """列出所有可用环境名。返回 ["默认"] + 已保存的环境名。"""
+    env_dir = get_env_dir(config_path)
+    names = []
+    if os.path.isdir(env_dir):
+        for fn in sorted(os.listdir(env_dir)):
+            if fn.endswith('.json'):
+                names.append(fn[:-5])
+    return ['默认'] + names
+
+
+def load_environment(config_path, name):
+    """加载指定环境的配置。'默认' 表示 config.json 本身。"""
+    if name in (None, '', '默认'):
+        return load_config(config_path)
+    env_path = os.path.join(get_env_dir(config_path), f'{name}.json')
+    if not os.path.exists(env_path):
+        raise FileNotFoundError(f'环境配置不存在: {env_path}')
+    return load_config(env_path)
+
+
+def save_environment(config_path, name, app_config):
+    """保存当前配置为指定环境。'默认' 表示 config.json 本身。"""
+    if name in (None, '', '默认'):
+        return save_config(app_config, config_path)
+    env_dir = get_env_dir(config_path)
+    os.makedirs(env_dir, exist_ok=True)
+    env_path = os.path.join(env_dir, f'{name}.json')
+    return save_config(app_config, env_path)
+
+
+# ===================== 数据加密（K） =====================
+
+def encrypt_data(text, password):
+    """用密码对文本做简单可逆加密（XOR + base64）。
+
+    Args:
+        text: 明文
+        password: 密码
+
+    Returns:
+        str: 密文（base64）
+    """
+    import base64
+    if not password:
+        return text
+    key = hashlib.sha256(password.encode('utf-8')).digest()
+    data = text.encode('utf-8')
+    enc = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+    return base64.b64encode(enc).decode('ascii')
+
+
+def decrypt_data(cipher, password):
+    """解密 encrypt_data 的结果。"""
+    import base64
+    if not password:
+        return cipher
+    try:
+        key = hashlib.sha256(password.encode('utf-8')).digest()
+        enc = base64.b64decode(cipher.encode('ascii'))
+        dec = bytes(b ^ key[i % len(key)] for i, b in enumerate(enc))
+        return dec.decode('utf-8')
+    except Exception:
+        raise ValueError('密码错误或数据已损坏')
+
+
+def save_config_encrypted(app_config, config_path, password):
+    """加密保存配置。密码为空则普通保存。"""
+    data = app_config.to_dict()
+    data.setdefault('_comment', '角色及提成配置（已加密）')
+    json_text = json.dumps(data, ensure_ascii=False, indent=2)
+    if password:
+        cipher = encrypt_data(json_text, password)
+        payload = {'__encrypted__': True, 'data': cipher}
+        json_text = json.dumps(payload, ensure_ascii=False, indent=2)
+    dir_path = os.path.dirname(config_path)
+    with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', suffix='.json',
+                                     dir=dir_path, delete=False) as tmp:
+        tmp.write(json_text)
+        tmp_path = tmp.name
+    try:
+        os.replace(tmp_path, config_path)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+    return config_path
+
+
+def load_config_encrypted(config_path, password=''):
+    """加载配置；若检测到加密则需密码解密。"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f'配置文件不存在: {config_path}')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        raw = json.load(f)
+    if isinstance(raw, dict) and raw.get('__encrypted__'):
+        if not password:
+            raise ValueError('配置文件已加密，请输入密码')
+        decrypted = decrypt_data(raw.get('data', ''), password)
+        raw = json.loads(decrypted)
+    return _parse_config_dict(raw, config_path)
+
+
+# ===================== 配置迁移（L） =====================
+
+def migrate_config(raw):
+    """将旧版 config 迁移到当前结构。
+
+    兼容旧字段名：
+    - '规则' / 'rule' / 'rules' → rules
+    - '人员' / '人员配置' / '人员角色表' → 人员角色
+    - '分组' / '组' → 小组
+    - '排序' → 人员排序
+
+    Args:
+        raw: 原始 config dict
+
+    Returns:
+        (migrated_dict, changed_keys: list[str])
+    """
+    if not isinstance(raw, dict):
+        return raw, []
+    changed = []
+
+    # 规则迁移
+    if 'rules' not in raw:
+        for old_key in ['规则', 'rule']:
+            if old_key in raw and isinstance(raw[old_key], dict):
+                raw['rules'] = raw[old_key]
+                changed.append(old_key)
+                break
+    # 人员角色迁移
+    if '人员角色' not in raw:
+        for old_key in ['人员', '人员配置', '人员角色表']:
+            if old_key in raw and isinstance(raw[old_key], dict):
+                raw['人员角色'] = raw[old_key]
+                changed.append(old_key)
+                break
+    # 小组迁移
+    if '小组' not in raw:
+        for old_key in ['分组', '组']:
+            if old_key in raw and isinstance(raw[old_key], dict):
+                raw['小组'] = raw[old_key]
+                changed.append(old_key)
+                break
+    # 排序迁移
+    if '人员排序' not in raw:
+        for old_key in ['排序', 'order']:
+            if old_key in raw and isinstance(raw[old_key], list):
+                raw['人员排序'] = raw[old_key]
+                changed.append(old_key)
+                break
+    return raw, changed

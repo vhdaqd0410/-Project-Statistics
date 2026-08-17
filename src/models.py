@@ -71,6 +71,7 @@ class AppConfig:
     project_templates: dict[str, Any] = field(default_factory=dict)  # 智能分集项目模板
     version: str = "1.0.0"                                        # 当前版本号
     update_check: bool = True                                     # 是否检查更新
+    favorites: list[str] = field(default_factory=list)            # 常用操作收藏
 
     @property
     def all_names(self) -> list[str]:
@@ -114,6 +115,7 @@ class AppConfig:
             project_templates=dict(data.get("project_templates", {})),
             version=data.get("version", "1.0.0"),
             update_check=bool(data.get("update_check", True)),
+            favorites=list(data.get("favorites", [])),
         )
 
     def to_dict(self) -> dict:
@@ -150,6 +152,7 @@ class AppConfig:
             "project_templates": dict(self.project_templates),
             "version": self.version,
             "update_check": self.update_check,
+            "favorites": list(self.favorites),
         }
 
 

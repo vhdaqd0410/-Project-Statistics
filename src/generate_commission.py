@@ -20,19 +20,50 @@ from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
 from copy import copy
 
-# 强制 stdout 使用 UTF-8，避免 Windows GBK 编码报错（仅在直接运行时）
-if __name__ == '__main__' or (len(sys.argv) >= 2 and sys.stdout.encoding != 'utf-8'):
+# 强制 stdout/stderr 使用 UTF-8，避免 Windows GBK 编码报错（无论作为主程序运行还是被 GUI 导入）
+for _stream in (sys.stdout, sys.stderr):
     try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if _stream is not None and hasattr(_stream, 'reconfigure'):
+            _stream.reconfigure(encoding='utf-8', errors='replace')
     except Exception:
         pass
+
+
+def _force_utf8_stdio():
+    """确保 stdout/stderr 为 UTF-8；若无法重配置(如 pythonw 下为 None/哑流)则换用安全编码，
+    避免 print('⚠'...) 触发 GBK UnicodeEncodeError。"""
+    for _name in ('stdout', 'stderr'):
+        _s = getattr(sys, _name)
+        if _s is None:
+            # pythonw 无控制台：换成一个丢弃所有输出的 UTF-8 哑流，避免 print 抛错
+            try:
+                import io
+                setattr(sys, _name, io.StringIO())
+            except Exception:
+                pass
+            continue
+        try:
+            if hasattr(_s, 'reconfigure'):
+                _s.reconfigure(encoding='utf-8', errors='replace')
+        except Exception:
+            try:
+                import io
+                setattr(sys, _name, io.StringIO())
+            except Exception:
+                pass
 
 # ===================== 路径 =====================
 try:
     SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:
     SCRIPT_DIR = os.getcwd()
-ROOT_DIR = os.path.dirname(SCRIPT_DIR)  # 项目根目录
+
+# 打包成 exe 后，`__file__` 指向只读的 _MEIPASS 临时解压目录，
+# 而 config.json / data 等应读取 exe 所在的可写目录（便携）。
+if getattr(sys, 'frozen', False):
+    ROOT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    ROOT_DIR = os.path.dirname(SCRIPT_DIR)  # 项目根目录
 
 # 支持命令行参数：python generate_commission.py [项目文件] [模板文件] [输出目录]
 # 可选：--overtime-file 本次生成使用的超时标记 JSON 文件。
@@ -309,6 +340,7 @@ def load_overtime_map(overtime_file):
 
 def parse_projects(df, default_year=None, overtime_map=None):
     """解析项目表；项目标题不完整时跳过其分配行并输出明确警告。"""
+    _force_utf8_stdio()  # 确保 print 特殊字符不触发 GBK 报错
     records = []
     proj_name, proj_id, end_date = '', '', None
     project_catalog = {}
@@ -760,6 +792,16 @@ def _auto_fit_sheet(ws, data_start, last_row):
     ws.row_dimensions[2].height = 33
     ws.row_dimensions[3].height = 48
 
+    # F: 打印设置 —— 横向、适应页宽、缩放
+    try:
+        ws.page_setup.orientation = 'landscape'
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 0
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.print_options.horizontalCentered = True
+    except Exception:
+        pass
+
 
 def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
                         data_font, center_align, center_wrap, full_border):
@@ -784,6 +826,20 @@ def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
     role = cd.get('role', '')
     rule = cd.get('rule', {})
     project_count = cd.get('project_count', 0)
+
+    # F: 按角色给 B/C 列（姓名/角色区）着色
+    role_fill = {
+        '剪辑组长': 'FEF3EB', '一卡剪辑': 'E6F7F0',
+        '二卡剪辑': 'EAF2FF', '剪辑助理': 'F3F0FF', '小组长': 'FEF6EC',
+    }
+    try:
+        _rf = role_fill.get(role, '')
+        if _rf:
+            for _col_letter in ['B', 'C']:
+                for _rr in range(start, end + 1):
+                    ws.cell(_rr, ord(_col_letter) - 64).fill = PatternFill('solid', fgColor=_rf)
+    except Exception:
+        pass
 
     # M: 总项目数/集数（组长填"项目数/集数"，其他人填集数）
     if role == '剪辑组长':
@@ -834,6 +890,15 @@ def _apply_person_merge(ws, start, end, name, sorted_records, comm_data,
             r_value = f'-({quota}-{total_ep})×{short_price}={total_comm}'
     c = ws.cell(start, 18, r_value)
     c.font = data_font; c.alignment = center_align; c.border = full_border
+    # F: 条件格式 —— 提成合计为正标绿、为负标红
+    try:
+        if total_comm > 0:
+            c.fill = PatternFill('solid', fgColor='E6F7F0')
+        elif total_comm < 0:
+            c.fill = PatternFill('solid', fgColor='FEF0F0')
+            c.font = Font(name='宋体', size=14, bold=False, color='CC0000')
+    except Exception:
+        pass
 
     # S: 奖/罚（不填，留空）
 
@@ -1212,6 +1277,97 @@ def print_summary(records, commission_data):
 
 
 # ===================== 主程序 =====================
+
+def generate_in_process(project_file, template_file, output_dir, overtime_data=None, log=None):
+    """进程内生成提成表（供 GUI 打包成 exe 时使用，无需外部 Python 子进程）。
+
+    复刻 main() 的核心逻辑，直接在本进程内完成：
+    读取项目数据 -> 解析月份 -> 计算提成 -> 生成 Excel + HTML 仪表盘。
+    返回 (final_excel_path, html_path)；失败时抛出异常。
+
+    Args:
+        project_file: 项目数据 xlsx 路径
+        template_file: 提成表模板 xlsx 路径
+        output_dir: 输出目录
+        overtime_data: 超时标记 dict {项目ID: [集数...]}
+        log: 可选回调，用于输出进度信息（GUI 显示日志）
+    """
+    def _log(msg):
+        if log:
+            log(msg)
+
+    # 参数存在性检查
+    for f, desc in [(project_file, '项目数据文件'), (template_file, '模板文件')]:
+        if not os.path.exists(f):
+            raise FileNotFoundError(f'找不到{desc}: {f}')
+
+    global OUTPUT_MONTH, TEMPLATE_DATE, TEMPLATE_YEAR, OUTPUT_FILE, OVERTIME_FILE
+
+    _log(f"🔍 数据源: {os.path.basename(project_file)}")
+
+    # 确保输出目录存在
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    # 读取项目数据
+    df = pd.read_excel(project_file, header=None)
+
+    # 用数据文件的真实月份覆盖模板月份
+    data_cn, data_month_num = get_month_from_data(df)
+    if data_cn and data_month_num:
+        template_year_match = re.match(r'(\d{4})年', TEMPLATE_DATE)
+        cur_year = template_year_match.group(1) if template_year_match else str(datetime.date.today().year)
+        OUTPUT_MONTH = data_cn
+        TEMPLATE_DATE = f'{cur_year}年{data_month_num:02d}月'
+        TEMPLATE_YEAR = int(cur_year)
+        OUTPUT_FILE = os.path.join(output_dir, f'AI后期剪辑提成一组{OUTPUT_MONTH}.xlsx')
+        _log(f"📅 数据文件月份: {TEMPLATE_DATE}（已按数据月份覆盖模板）")
+    else:
+        _log(f"📅 未识别到月份，使用模板月份: {TEMPLATE_DATE}")
+
+    # 超时标记：写入临时文件供 load_overtime_map 读取
+    overtime_file = OVERTIME_FILE
+    tmp_ot_file = None
+    if overtime_data:
+        import tempfile
+        fd, tmp_ot_file = tempfile.mkstemp(suffix='.json', prefix='overtime_')
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(overtime_data, f, ensure_ascii=False, indent=2)
+        overtime_file = tmp_ot_file
+
+    try:
+        overtime_map = load_overtime_map(overtime_file) if overtime_file else {}
+        if overtime_map:
+            total_ot = sum(len(v) for v in overtime_map.values())
+            _log(f'⏱️ 已加载本次超时集数: {total_ot}集 ({len(overtime_map)}个项目)')
+
+        records, group_pids = parse_projects(
+            df, default_year=TEMPLATE_YEAR, overtime_map=overtime_map)
+        _log(f"   共 {len(records)} 条记录")
+        if not records:
+            raise ValueError('未解析到任何有效记录，请检查项目数据文件的格式。')
+
+        global_pids = set()
+        for pids in group_pids.values():
+            global_pids |= pids
+        _log(f"   全组去重项目数: {len(global_pids)} 部")
+
+        self_check(records)
+
+        _log("🧮 计算绩效和提成...")
+        commission_data = compute_commission(records, group_pids)
+
+        final_path, html_path = generate_excel(records, commission_data, template_file, OUTPUT_FILE)
+        _log(f"✅ Excel: {final_path}")
+        _log(f"📊 HTML: {html_path}")
+        return final_path, html_path
+    finally:
+        if tmp_ot_file:
+            try:
+                os.unlink(tmp_ot_file)
+            except OSError:
+                pass
+
 
 def main():
     print()

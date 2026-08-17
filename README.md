@@ -1,6 +1,17 @@
-# 🎬 AI后期剪辑提成表生成工具 v8.0
+# 🎬 AI后期剪辑提成表生成工具 v9.0
 
 一键将 AI 项目分配表转换为完整的提成表，自动计算绩效、超额、缺集扣除和提成合计。内置可视化仪表盘、智能分集、绩效卡片、批量处理等十余项扩展功能。
+
+## 🆕 v9.0 更新要点
+
+- **修复**：解决打包 exe 后读取不到 `config.json`（路径指向只读临时目录）的问题，改为读取可写目录。
+- **修复**：修复"超时对话框取消/关闭"触发 `_output_files` 未初始化而崩溃的问题。
+- **修复**：异常上报不再导致无限弹窗，错误统一写入 `错误日志.txt`，弹窗最多一次。
+- **重构**：核心生成由外部 Python 子进程改为**进程内调用**（`generate_in_process`），不再依赖外部 Python。
+- **打包/部署**：提供 3 种交付方式——
+  - `build_release.bat`：打包便携 exe；
+  - **免安装版**：内置完整 Python 运行时（含 tkinter 及全部依赖），目标机解压即用、零环境配置（在 GitHub Release 附件中下载）；
+  - **绿色版**：源码 + 启动器，目标机可联网时自动安装依赖。
 
 ## ✨ 功能一览
 
@@ -33,9 +44,10 @@
 ### 1. 安装依赖
 
 ```bash
-pip install pandas openpyxl matplotlib
+pip install -r requirements.txt
 ```
 
+> `requirements.txt` 内容：`pandas`、`openpyxl`、`matplotlib`、`pillow`、`fpdf2`。
 > `tkinter` 为 Python 标准库（Windows 下已内置）。
 
 ### 2. 配置角色
@@ -62,6 +74,29 @@ copy config.example.json config.json
 ```
 
 > 💡 `config.json` 与项目数据文件（`data/*.xlsx`）包含真实人员姓名和项目数据，**已被 .gitignore 排除，不会提交到仓库**。请使用 `config.example.json` 作为配置模板。
+
+---
+
+## 📦 部署方式（三选一）
+
+根据目标电脑情况，选一种方式交付：
+
+| 方式 | 适用场景 | 目标机要求 | 说明 |
+|---|---|---|---|
+| **免安装版**（推荐） | 不想装任何东西 | 无（解压即用） | 内置完整 Python 运行时 + 全部依赖，双击 `启动工具.bat` 即用。在 GitHub **Release 附件**下载 `提成工具-免安装版.zip`。 |
+| **绿色版** | 目标机可联网 | 无（需联网） | 源码 + 启动器，双击 `一键启动.bat` 自动检测/安装依赖。 |
+| **便携 exe** | 想用单个 exe | 无 | 运行 `build_release.bat` 自行打包。 |
+
+**免安装版结构**（解压后双击 `启动工具.bat`）：
+```
+提成工具-免安装版\
+├─ 启动工具.bat    ← 双击启动（零配置）
+├─ launcher.py
+├─ python\          ← 内置 Python 3.13 + 依赖
+└─ 源代码\          ← 程序 + 配置 + 示例数据
+```
+
+> 免安装版 zip 体积较大（约 110MB），不建议直接提交到仓库，请通过 GitHub Release 发布/分发。
 
 ---
 
@@ -101,7 +136,7 @@ copy config.example.json config.json
 ```
 ├── ai_commission_gui.py          # GUI 主程序
 ├── src/
-│   ├── generate_commission.py    # CLI 核心引擎（提成计算、Excel 生成、HTML 仪表盘）
+│   ├── generate_commission.py    # 核心引擎（提成计算、Excel 生成、HTML 仪表盘、进程内生成）
 │   ├── features.py               # 扩展功能（分集、对比、导出、导入、趋势、卡片等）
 │   ├── config_loader.py          # 配置加载与校验
 │   ├── models.py                 # 数据模型（dataclass）
@@ -109,8 +144,11 @@ copy config.example.json config.json
 │   └── utils.py                  # 共享工具函数
 ├── tests/                        # 回归测试
 ├── config.example.json           # 配置示例模板（不含真实数据）
-├── 启动工具.vbs                   # 无黑窗启动器
+├── requirements.txt              # Python 依赖清单
+├── 启动工具.vbs                   # 无黑窗启动器（源码方式）
 ├── install.bat                   # 一键安装依赖
+├── build_exe.bat                 # 打包便携 exe
+├── build_release.bat             # 一键打包并组装便携版目录
 ├── .gitignore
 └── README.md
 ```

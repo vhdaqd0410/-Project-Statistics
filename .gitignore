@@ -38,3 +38,15 @@ reasonix.toml
 # 生成的产出文件
 *_仪表盘.html
 *八月*.xlsx
+
+# 构建 / 部署产物（体积大，可重建，不入库；如需分发请用 GitHub Release 附件）
+build/
+dist/
+*.spec
+history/
+release/
+_unpack_test/
+*.zip
+提成工具-便携版/
+提成工具-免安装版/
+提成工具-绿色版/

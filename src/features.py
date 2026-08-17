@@ -1193,3 +1193,637 @@ def export_to_json(records, commission_data, output_dir):
     with open(json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2, default=str)
     return json_path
+
+
+# ===================== #1 历史数据累积与跨月趋势库 =====================
+
+def archive_history(records, commission_data, history_dir, month_label):
+    """将本次生成的数据归档到 history/ 目录。
+
+    Args:
+        records: 解析后的记录列表
+        commission_data: 提成计算结果
+        history_dir: 历史数据目录（默认 history/）
+        month_label: 月份标签，如 '2026年08月'
+
+    Returns:
+        归档文件路径
+    """
+    os.makedirs(history_dir, exist_ok=True)
+    summary = {
+        'total_people': len(commission_data),
+        'total_commission': sum(cd.get('total_commission', 0) for cd in commission_data.values()),
+        'total_episodes': sum(r.get('单项目数/集数', 0) for r in records),
+    }
+    data = {
+        'month': month_label,
+        'summary': summary,
+        'records': records,
+        'commission': commission_data,
+    }
+    safe_month = re.sub(r'[\/:*?"<>|]', '_', str(month_label))
+    json_path = os.path.join(history_dir, f'{safe_month}.json')
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2, default=str)
+    return json_path
+
+
+def load_history(history_dir):
+    """读取 history/ 目录下所有月份的归档数据。
+
+    Returns:
+        list[dict]：每个元素含 month/summary/records/commission，按月份排序
+    """
+    if not os.path.isdir(history_dir):
+        return []
+    entries = []
+    for fn in sorted(os.listdir(history_dir)):
+        if not fn.endswith('.json'):
+            continue
+        try:
+            with open(os.path.join(history_dir, fn), 'r', encoding='utf-8') as f:
+                entries.append(json.load(f))
+        except Exception:
+            continue
+    return entries
+
+
+def generate_trend_report(history_dir, output_dir):
+    """基于历史数据生成跨月趋势 HTML（收入/集数折线图 + 明细表）。
+
+    Returns:
+        html_path 或 None（无历史数据时）
+    """
+    entries = load_history(history_dir)
+    if not entries:
+        return None
+    # 收集所有人员
+    persons = set()
+    for e in entries:
+        for nm in e.get('commission', {}):
+            persons.add(nm)
+    persons = sorted(persons)
+    months = [e.get('month', '?') for e in entries]
+
+    # 每人各月提成/集数
+    comm_matrix = {nm: [] for nm in persons}
+    eps_matrix = {nm: [] for nm in persons}
+    for e in entries:
+        cd = e.get('commission', {})
+        for nm in persons:
+            comm_matrix[nm].append(cd.get(nm, {}).get('total_commission', 0))
+            eps_matrix[nm].append(cd.get(nm, {}).get('total_episodes', 0))
+
+    # 生成 SVG 折线图（人员提成趋势）
+    def _polyline(values, color, max_v):
+        if max_v <= 0:
+            return ''
+        w, h = 400, 120
+        pts = []
+        n = len(values)
+        for i, v in enumerate(values):
+            x = 10 + i * ((w - 20) / max(1, n - 1))
+            y = h - 10 - (abs(v) / max_v) * (h - 20)
+            pts.append(f'{x:.1f},{y:.1f}')
+        return f'<polyline points="{" ".join(pts)}" fill="none" stroke="{color}" stroke-width="2"/>'
+
+    def _build_chart(per_person_values, title, color, unit):
+        rows = ''
+        for nm in persons:
+            vals = per_person_values[nm]
+            max_v = max([abs(v) for v in vals] + [1])
+            svg = (f'<svg viewBox="0 0 400 120" width="100%" height="120">'
+                   f'<polyline points="" fill="none"/>'
+                   f'{_polyline(vals, color, max_v)}'
+                   f'</svg>')
+            labels = ''.join(f'<span class="m">{months[i]}<b>{vals[i]}</b>{unit}</span>' for i in range(len(vals)))
+            rows += f'<div class="tr"><div class="tl">{nm}</div><div class="tc">{svg}</div><div class="tv">{labels}</div></div>'
+        return rows
+
+    html = f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>跨月趋势总览</title>
+<style>
+body{{font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#f0f4f8;color:#2c3e50;margin:0}}
+.hd{{background:linear-gradient(135deg,#1a5276,#2e86c1);color:#fff;padding:28px 40px;text-align:center}}
+.hd h1{{font-size:26px;margin:0;letter-spacing:2px}}.hd p{{opacity:.85;margin-top:6px}}
+.ct{{max-width:1100px;margin:0 auto;padding:24px 20px}}
+.pn{{background:#fff;border-radius:12px;padding:20px 24px;box-shadow:0 2px 12px rgba(0,0,0,.06);margin-bottom:24px}}
+.pn h2{{font-size:18px;color:#1a5276;margin-bottom:14px;border-bottom:2px solid #d6e4f0;padding-bottom:10px}}
+.tr{{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid #eef2f7}}
+.tl{{min-width:80px;font-weight:600;font-size:14px}}
+.tc{{flex:1}}.tv{{display:flex;gap:8px;font-size:11px;color:#7f8c8d;flex-wrap:wrap}}
+.tv span{{background:#eaf2f8;padding:2px 8px;border-radius:8px;white-space:nowrap}}
+.tv b{{color:#2980b9;margin:0 3px}}
+.summary{{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}}
+.sd{{background:#fff;border-radius:10px;padding:16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.05)}}
+.sd .v{{font-size:28px;font-weight:700;color:#2980b9}}.sd .l{{font-size:12px;color:#7f8c8d;margin-top:4px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{background:#d6e4f0;color:#1a5276;padding:8px;border-bottom:2px solid #b0c4de}}
+td{{padding:6px 8px;border-bottom:1px solid #eef2f7;text-align:center}}
+.ft{{text-align:center;padding:18px;color:#95a5a6;font-size:12px}}
+</style></head><body>
+<div class="hd"><h1>📈 跨月趋势总览</h1><p>{len(months)} 个月 · {len(persons)} 人 · 自动生成</p></div>
+<div class="ct">
+<div class="summary">
+<div class="sd"><div class="v">{len(months)}</div><div class="l">累计月份</div></div>
+<div class="sd"><div class="v">{len(persons)}</div><div class="l">参与人员</div></div>
+<div class="sd"><div class="v">{sum(e.get("summary",{}).get("total_commission",0) for e in entries):,}</div><div class="l">累计提成</div></div>
+<div class="sd"><div class="v">{sum(e.get("summary",{}).get("total_episodes",0) for e in entries):,}</div><div class="l">累计集数</div></div>
+</div>
+<div class="pn"><h2>💵 提成趋势（各月）</h2>{_build_chart(comm_matrix, "提成", "#2e86c1", "元")}</div>
+<div class="pn"><h2>🎬 集数趋势（各月）</h2>{_build_chart(eps_matrix, "集数", "#27ae60", "集")}</div>
+<div class="pn"><h2>📊 明细汇总表</h2><div style="overflow-x:auto"><table>
+<thead><tr><th>人员</th>{''.join(f'<th>{m}</th>' for m in months)}</tr></thead>
+<tbody>
+{''.join(f'<tr><td><b>{nm}</b></td>' + ''.join(f'<td>{comm_matrix[nm][i]}</td>' for i in range(len(months))) + '</tr>' for nm in persons)}
+</tbody></table></div></div>
+</div>
+<div class="ft">AI后期剪辑提成表生成工具 v8.0 · 跨月趋势总览</div>
+</body></html>'''
+    os.makedirs(output_dir, exist_ok=True)
+    html_path = os.path.join(output_dir, '跨月趋势总览.html')
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    return html_path
+
+
+# ===================== #3 年度汇总 =====================
+
+def generate_annual_summary(history_dir, output_dir):
+    """基于历史数据生成年度汇总对比 Excel（每人各月集数/提成矩阵）。
+
+    Returns:
+        excel_path 或 None（无历史数据时）
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+
+    entries = load_history(history_dir)
+    if not entries:
+        return None
+    months = [e.get('month', '?') for e in entries]
+    persons = sorted(set(
+        nm for e in entries for nm in e.get('commission', {})
+    ))
+
+    wb = Workbook()
+    # Sheet1: 集数汇总
+    ws1 = wb.active
+    ws1.title = '集数汇总'
+    title_font = Font(name='宋体', size=14, bold=True)
+    hdr_font = Font(name='宋体', size=11, bold=True, color='1F4E79')
+    data_font = Font(name='宋体', size=11)
+    center = Alignment(horizontal='center', vertical='center')
+    thin = Side(style='thin')
+    bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
+    hdr_fill = PatternFill('solid', fgColor='D6E4F0')
+    total_fill = PatternFill('solid', fgColor='F3F6FA')
+
+    # 标题
+    ws1.merge_cells(f'A1:{chr(64+2+len(months))}1')
+    ws1.cell(1, 1, f'年度集数汇总（{months[0]} ~ {months[-1]}）').font = title_font
+    ws1.cell(1, 1).alignment = center
+
+    # 表头：人员 + 各月
+    ws1.cell(2, 1, '人员').font = hdr_font
+    for i, m in enumerate(months):
+        c = ws1.cell(2, 2 + i, m); c.font = hdr_font; c.alignment = center
+    # 每行数据
+    r = 3
+    for nm in persons:
+        ws1.cell(r, 1, nm).font = data_font
+        for i in range(len(months)):
+            c = ws1.cell(r, 2 + i, 0); c.font = data_font; c.alignment = center
+        r += 1
+    for i, e in enumerate(entries):
+        cd = e.get('commission', {})
+        for pi, nm in enumerate(persons):
+            ws1.cell(3 + pi, 2 + i, cd.get(nm, {}).get('total_episodes', 0))
+
+    # Sheet2: 提成汇总
+    ws2 = wb.create_sheet('提成汇总')
+    ws2.merge_cells(f'A1:{chr(64+2+len(months))}1')
+    ws2.cell(1, 1, f'年度提成汇总（{months[0]} ~ {months[-1]}）').font = title_font
+    ws2.cell(1, 1).alignment = center
+    ws2.cell(2, 1, '人员').font = hdr_font
+    for i, m in enumerate(months):
+        c = ws2.cell(2, 2 + i, m); c.font = hdr_font; c.alignment = center
+    r = 3
+    for nm in persons:
+        ws2.cell(r, 1, nm).font = data_font
+        r += 1
+    for i, e in enumerate(entries):
+        cd = e.get('commission', {})
+        for pi, nm in enumerate(persons):
+            ws2.cell(3 + pi, 2 + i, cd.get(nm, {}).get('total_commission', 0))
+
+    # 应用边框/对齐
+    for ws in [ws1, ws2]:
+        for row in ws.iter_rows(min_row=2, max_row=len(persons) + 2, max_col=1 + len(months)):
+            for cell in row:
+                cell.border = bdr
+                cell.alignment = center
+        ws.column_dimensions['A'].width = 12
+        for i in range(len(months)):
+            ws.column_dimensions[chr(66 + i)].width = 16
+
+    os.makedirs(output_dir, exist_ok=True)
+    excel_path = os.path.join(output_dir, '年度汇总对比.xlsx')
+    wb.save(excel_path)
+    return excel_path
+
+
+# ===================== #4 异常/风险预警 =====================
+
+def scan_anomalies(records, commission_data, history_dir=None, monthly_goals=None):
+    """扫描异常/风险，返回告警列表。
+
+    检测项：
+    - 未达标人员（is_complete == '否'）
+    - 集数骤降（与上一月相比下降 >= 40%）
+    - 超时占比过高（超时集数 / 总集数 >= 30%）
+    - 目标严重滞后（实际集数 < 目标集数的 70%）
+
+    Returns:
+        list[dict]：每条 {type, level, person, msg}
+    """
+    warnings = []
+    monthly_goals = monthly_goals or {}
+
+    # 1) 未达标
+    for nm, cd in commission_data.items():
+        if cd.get('is_complete') == '否':
+            warnings.append({
+                'type': '未达标', 'level': '高', 'person': nm,
+                'msg': f'未完成基准集数（{cd.get("total_episodes", 0)}/{cd.get("quota", 0)}）'
+            })
+
+    # 2) 目标滞后
+    for nm, goal in monthly_goals.items():
+        eps_goal = goal.get('episodes')
+        if eps_goal:
+            actual = commission_data.get(nm, {}).get('total_episodes', 0)
+            if eps_goal > 0 and actual < eps_goal * 0.7:
+                warnings.append({
+                    'type': '目标滞后', 'level': '中', 'person': nm,
+                    'msg': f'集数 {actual} < 目标 {eps_goal} 的70%'
+                })
+
+    # 3) 超时占比过高
+    person_overtime = {}
+    person_total = {}
+    for r in records:
+        nm = r.get('身份证姓名', '')
+        person_total[nm] = person_total.get(nm, 0) + r.get('单项目数/集数', 0)
+        person_overtime[nm] = person_overtime.get(nm, 0) + r.get('超时集数', 0)
+    for nm in person_total:
+        tot = person_total[nm]
+        ot = person_overtime.get(nm, 0)
+        if tot > 0 and ot / tot >= 0.3:
+            warnings.append({
+                'type': '超时偏高', 'level': '中', 'person': nm,
+                'msg': f'超时 {ot} 集 / 总 {tot} 集（{int(ot/tot*100)}%）'
+            })
+
+    # 4) 集数骤降（与上一月对比）
+    if history_dir:
+        entries = load_history(history_dir)
+        if len(entries) >= 2:
+            prev = entries[-2].get('commission', {})
+            for nm, cd in commission_data.items():
+                prev_eps = prev.get(nm, {}).get('total_episodes', 0)
+                cur_eps = cd.get('total_episodes', 0)
+                if prev_eps > 0 and cur_eps < prev_eps * 0.6:
+                    warnings.append({
+                        'type': '集数骤降', 'level': '中', 'person': nm,
+                        'msg': f'本月 {cur_eps} 集 < 上月 {prev_eps} 集的60%'
+                    })
+
+    # 按等级排序（高优先）
+    order = {'高': 0, '中': 1, '低': 2}
+    warnings.sort(key=lambda w: order.get(w.get('level', '低'), 9))
+    return warnings
+
+
+# ===================== #5 数据导入去重与清洗 =====================
+
+def clean_import_data(df, id_col=None, name_col=None):
+    """清洗导入数据：去重、去空行、标记异常。
+
+    Args:
+        df: pandas DataFrame 原始导入数据
+        id_col: 项目ID列索引（0-based），None 则自动探测
+        name_col: 人员名列索引，None 则自动探测
+
+    Returns:
+        (cleaned_df, report)：清洗后的 DataFrame 与报告列表
+    """
+    import pandas as pd
+    report = []
+    df = df.copy()
+
+    # 自动探测列：找含"项目"且含数字ID的列、含人名的列
+    if id_col is None or name_col is None:
+        for ci in range(min(df.shape[1], 10)):
+            sample = [str(x) for x in df.iloc[:30, ci].tolist() if pd.notna(x)]
+            joined = ' '.join(sample)
+            if name_col is None and any(len(s) in (2, 3) and s.isalpha() for s in sample if isinstance(s, str)):
+                # 姓名列通常短文本
+                name_col = ci
+            if id_col is None and any(s.isdigit() and len(s) >= 3 for s in sample if isinstance(s, str)):
+                id_col = ci
+
+    # 去空行
+    before = len(df)
+    df = df.dropna(how='all')
+    if len(df) < before:
+        report.append(f'移除空行 {before - len(df)} 行')
+
+    # 去重（按项目ID+人员，若可用）
+    if id_col is not None and id_col < df.shape[1]:
+        col_names = list(df.columns)
+        # subset 需要列名；若列名是默认整数则直接用索引名
+        def _col_ref(idx):
+            c = col_names[idx]
+            return c
+        dup_key = [_col_ref(id_col)]
+        if name_col is not None and name_col < df.shape[1]:
+            dup_key.append(_col_ref(name_col))
+        dup_before = len(df)
+        df = df.drop_duplicates(subset=dup_key, keep='first')
+        if len(df) < dup_before:
+            report.append(f'按项目ID/人员去重，移除重复 {dup_before - len(df)} 行')
+
+    # 标记空项目ID
+    if id_col is not None and id_col < df.shape[1]:
+        empty_ids = df[df.iloc[:, id_col].isna() | (df.iloc[:, id_col].astype(str).str.strip() == '')]
+        if len(empty_ids):
+            report.append(f'发现 {len(empty_ids)} 行缺少项目ID（已保留，请检查）')
+
+    report.append(f'清洗后共 {len(df)} 行（原始 {before} 行）')
+    return df, report
+
+
+# ===================== #7 导出增强 =====================
+
+def export_enhanced(records, commission_data, output_dir, split_by_role=False):
+    """增强导出：人员提成总表 + 可选按角色拆分 + Excel 多工作表。
+
+    Args:
+        records: 项目记录
+        commission_data: 提成结果
+        output_dir: 输出目录
+        split_by_role: 是否按角色拆分 CSV
+
+    Returns:
+        list[str]：生成的文件路径列表
+    """
+    import csv
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, Alignment, Border, Side
+
+    os.makedirs(output_dir, exist_ok=True)
+    created = []
+
+    # ---- 1) 增强 CSV：自定义列 ----
+    person_csv = os.path.join(output_dir, '人员提成_增强.csv')
+    with open(person_csv, 'w', newline='', encoding='utf-8-sig') as f:
+        w = csv.writer(f)
+        w.writerow(['姓名', '角色', '总集数', '基准', '绩效', '超额/组奖', '缺集扣除', '提成合计', '是否达标'])
+        for name in commission_data:
+            cd = commission_data.get(name, {})
+            extra = cd.get('overtime_bonus', 0) + cd.get('group_project_bonus', 0)
+            w.writerow([
+                name, cd.get('role', ''), cd.get('total_episodes', 0),
+                cd.get('quota', 0), cd.get('is_complete', ''),
+                extra, cd.get('shortage_penalty', 0), cd.get('total_commission', 0),
+                '✅' if cd.get('is_complete') == '是' else '❌',
+            ])
+    created.append(person_csv)
+
+    # ---- 2) 按角色拆分 CSV ----
+    if split_by_role:
+        roles = {}
+        for name, cd in commission_data.items():
+            r = cd.get('role', '未知')
+            roles.setdefault(r, []).append((name, cd))
+        for r, items in roles.items():
+            safe = re.sub(r'[\/:*?"<>|]', '_', str(r))
+            r_csv = os.path.join(output_dir, f'角色_{safe}.csv')
+            with open(r_csv, 'w', newline='', encoding='utf-8-sig') as f:
+                w = csv.writer(f)
+                w.writerow(['姓名', '角色', '总集数', '基准', '提成合计'])
+                for name, cd in items:
+                    w.writerow([name, r, cd.get('total_episodes', 0),
+                                cd.get('quota', 0), cd.get('total_commission', 0)])
+            created.append(r_csv)
+
+    # ---- 3) Excel 多工作表 ----
+    xlsx = os.path.join(output_dir, '提成汇总_多表.xlsx')
+    wb = Workbook()
+    title_font = Font(name='宋体', size=13, bold=True)
+    hdr_font = Font(name='宋体', size=11, bold=True, color='1F4E79')
+    data_font = Font(name='宋体', size=11)
+    center = Alignment(horizontal='center', vertical='center')
+    thin = Side(style='thin')
+    bdr = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # Sheet1: 汇总
+    ws = wb.active
+    ws.title = '汇总'
+    ws.merge_cells('A1:H1')
+    ws.cell(1, 1, '人员提成汇总').font = title_font
+    ws.cell(1, 1).alignment = center
+    hdrs = ['姓名', '角色', '总集数', '基准', '绩效', '超额/组奖', '缺集扣除', '提成合计']
+    for ci, h in enumerate(hdrs, 1):
+        c = ws.cell(2, ci, h); c.font = hdr_font; c.alignment = center
+    r = 3
+    for name, cd in commission_data.items():
+        extra = cd.get('overtime_bonus', 0) + cd.get('group_project_bonus', 0)
+        vals = [name, cd.get('role', ''), cd.get('total_episodes', 0), cd.get('quota', 0),
+                cd.get('is_complete', ''), extra, cd.get('shortage_penalty', 0), cd.get('total_commission', 0)]
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(r, ci, v); c.font = data_font; c.alignment = center
+        r += 1
+
+    # Sheet2: 按角色分组
+    ws2 = wb.create_sheet('按角色分组')
+    ws2.merge_cells('A1:D1')
+    ws2.cell(1, 1, '按角色分组').font = title_font
+    ws2.cell(1, 1).alignment = center
+    for ci, h in enumerate(['角色', '人数', '总集数', '提成合计'], 1):
+        c = ws2.cell(2, ci, h); c.font = hdr_font; c.alignment = center
+    role_agg = {}
+    for name, cd in commission_data.items():
+        r = cd.get('role', '未知')
+        a = role_agg.setdefault(r, {'count': 0, 'eps': 0, 'comm': 0})
+        a['count'] += 1
+        a['eps'] += cd.get('total_episodes', 0)
+        a['comm'] += cd.get('total_commission', 0)
+    r = 3
+    for role, a in role_agg.items():
+        for ci, v in enumerate([role, a['count'], a['eps'], a['comm']], 1):
+            c = ws2.cell(r, ci, v); c.font = data_font; c.alignment = center
+        r += 1
+
+    for ws_ in [ws, ws2]:
+        for row in ws_.iter_rows(min_row=2, max_row=max(ws_.max_row, 3), max_col=8):
+            for cell in row:
+                cell.border = bdr
+    wb.save(xlsx)
+    created.append(xlsx)
+    return created
+
+
+# ===================== #9 数据备份自动策略 =====================
+
+def auto_backup_config(config_path, history_dir, target_dir, keep=15):
+    """备份 config.json 和 history/ 目录到指定位置，保留最近 keep 份。
+
+    Returns:
+        list[str]：本次备份生成的文件路径
+    """
+    import shutil as _sh
+    os.makedirs(target_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    created = []
+
+    # 备份 config.json
+    if os.path.exists(config_path):
+        dest = os.path.join(target_dir, f'config_{ts}.json')
+        _sh.copy2(config_path, dest)
+        created.append(dest)
+
+    # 备份 history/ 目录（打包为 zip）
+    if os.path.isdir(history_dir) and os.listdir(history_dir):
+        import zipfile
+        zip_path = os.path.join(target_dir, f'history_{ts}.zip')
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for fn in os.listdir(history_dir):
+                fp = os.path.join(history_dir, fn)
+                if os.path.isfile(fp):
+                    zf.write(fp, fn)
+        created.append(zip_path)
+
+    # 清理旧备份，保留最近 keep 份
+    if keep > 0:
+        backups = sorted([f for f in os.listdir(target_dir)
+                          if f.startswith(('config_', 'history_')) and f.endswith(('.json', '.zip'))],
+                         reverse=True)
+        for old in backups[keep * 2:]:
+            try:
+                os.unlink(os.path.join(target_dir, old))
+            except OSError:
+                pass
+
+    return created
+
+
+def backup_due(policy, last_backup_time):
+    """判断自动备份是否到期。
+
+    Args:
+        policy: 备份策略 dict {enabled, interval_days}
+        last_backup_time: 上次备份时间（datetime 或 None）
+
+    Returns:
+        bool
+    """
+    if not policy or not policy.get('enabled'):
+        return False
+    interval = int(policy.get('interval_days', 7))
+    if interval <= 0:
+        return False
+    if last_backup_time is None:
+        return True
+    return (datetime.datetime.now() - last_backup_time).days >= interval
+
+
+# ===================== #11 移动端/网页只读版 =====================
+
+def generate_readonly_dashboard(history_dir, serve_dir):
+    """生成只读看板页（供主管在线查看，无需安装软件）。
+
+    从 history/ 聚合各月数据，生成一个自包含 HTML 总览页。
+
+    Returns:
+        html_path 或 None
+    """
+    entries = load_history(history_dir)
+    if not entries:
+        return None
+    months = [e.get('month', '?') for e in entries]
+    persons = sorted(set(nm for e in entries for nm in e.get('commission', {})))
+
+    # 总览卡片
+    total_comm = sum(e.get('summary', {}).get('total_commission', 0) for e in entries)
+    total_eps = sum(e.get('summary', {}).get('total_episodes', 0) for e in entries)
+
+    # 最近一月明细表
+    last = entries[-1].get('commission', {})
+    detail_rows = ''
+    for nm in persons:
+        cd = last.get(nm, {})
+        st = cd.get('is_complete', '')
+        badge = '<span class="b ok">✓</span>' if st == '是' else ('<span class="b no">✗</span>' if st == '否' else '-')
+        detail_rows += f'<tr><td>{nm}</td><td>{cd.get("role","")}</td><td>{cd.get("total_episodes",0)}</td><td>{cd.get("total_commission",0)}</td><td>{badge}</td></tr>'
+
+    # 趋势数据（各月提成合计）
+    monthly_comm = [e.get('summary', {}).get('total_commission', 0) for e in entries]
+    max_c = max(monthly_comm + [1])
+    bars = ''
+    for i, m in enumerate(months):
+        pct = int(monthly_comm[i] / max_c * 100)
+        bars += f'<div class="bar-row"><span class="bl">{m}</span><div class="bt"><div class="bf" style="width:{pct}%;background:#3b82f6"></div></div><span class="bv">{monthly_comm[i]:,}</span></div>'
+
+    html = f'''<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>提成数据 · 只读看板</title>
+<style>
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{font-family:'Microsoft YaHei',sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
+.header{{background:linear-gradient(135deg,#1e3a5f,#3b82f6);padding:24px;text-align:center}}
+.header h1{{font-size:24px;color:#fff;letter-spacing:2px}}.header p{{font-size:13px;opacity:.8;margin-top:4px}}
+.ct{{max-width:1100px;margin:0 auto;padding:20px}}
+.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px;margin-bottom:20px}}
+.sd{{background:#1e293b;border-radius:12px;padding:18px;text-align:center}}
+.sd .v{{font-size:30px;font-weight:700;color:#60a5fa}}.sd .l{{font-size:12px;color:#94a3b8;margin-top:4px}}
+.pn{{background:#1e293b;border-radius:12px;padding:20px;margin-bottom:20px}}
+.pn h2{{font-size:16px;color:#93c5fd;margin-bottom:14px;border-bottom:1px solid #334155;padding-bottom:8px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+th{{text-align:left;padding:8px;color:#94a3b8;border-bottom:1px solid #334155}}
+td{{padding:8px;border-bottom:1px solid #1e293b}}
+.b{{display:inline-block;padding:1px 8px;border-radius:8px;font-size:12px}}
+.b.ok{{background:#065f46;color:#6ee7b7}}.b.no{{background:#7f1d1d;color:#fca5a5}}
+.bar-row{{display:flex;align-items:center;gap:10px;margin:6px 0}}
+.bl{{min-width:90px;font-size:12px;color:#94a3b8;text-align:right}}
+.bt{{flex:1;height:18px;background:#334155;border-radius:4px}}
+.bf{{height:100%;border-radius:4px}}
+.bv{{min-width:70px;font-size:13px;font-weight:600;color:#60a5fa;text-align:left}}
+.footer{{text-align:center;padding:18px;color:#475569;font-size:12px}}
+@media(max-width:600px){{.header{{padding:16px}}.ct{{padding:12px}}.cards{{grid-template-columns:1fr 1fr}}}}
+</style></head><body>
+<div class="header"><h1>📊 提成数据 · 只读看板</h1>
+<p>{len(months)} 个月 · {len(persons)} 人 · 只读模式</p></div>
+<div class="ct">
+<div class="cards">
+<div class="sd"><div class="v">{len(months)}</div><div class="l">累计月份</div></div>
+<div class="sd"><div class="v">{len(persons)}</div><div class="l">参与人员</div></div>
+<div class="sd"><div class="v">{total_comm:,}</div><div class="l">累计提成（元）</div></div>
+<div class="sd"><div class="v">{total_eps:,}</div><div class="l">累计集数</div></div>
+</div>
+<div class="pn"><h2>📈 月度提成趋势</h2>{bars}</div>
+<div class="pn"><h2>👥 最新月份明细（{months[-1]}）</h2><div style="overflow-x:auto"><table>
+<thead><tr><th>姓名</th><th>角色</th><th>集数</th><th>提成</th><th>绩效</th></tr></thead>
+<tbody>{detail_rows}</tbody></table></div></div>
+</div>
+<div class="footer">AI后期剪辑提成工具 · 只读看板 · 数据自动汇总</div>
+</body></html>'''
+    os.makedirs(serve_dir, exist_ok=True)
+    html_path = os.path.join(serve_dir, '只读看板.html')
+    with open(html_path, 'w', encoding='utf-8') as f:
+        f.write(html)
+    return html_path

@@ -5,13 +5,34 @@ from tkinter import ttk, messagebox, filedialog
 import subprocess, threading, os, sys, json, re, tempfile
 from datetime import datetime
 
+# 强制 stdout/stderr 使用 UTF-8，避免 Windows GBK 无法编码 ⚠/emoji 等字符导致报错
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        if _stream is not None and hasattr(_stream, 'reconfigure'):
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-SRC_DIR = os.path.join(SCRIPT_DIR, 'src')
+
+# 可写数据基目录：打包成 exe 后，config/data/output 等应位于 exe 旁的可写目录（便携），
+# 而不是只读的 _MEIPASS 临时解压目录。源码运行时则使用脚本所在目录。
+FROZEN = bool(getattr(sys, 'frozen', False))
+if FROZEN:
+    # _MEIPASS：PyInstaller 解压 bundled 源码的临时目录（只读）
+    MEIPASS = getattr(sys, '_MEIPASS', SCRIPT_DIR)
+    SRC_DIR = os.path.join(MEIPASS, 'src')
+    DATA_DIR = os.path.dirname(os.path.abspath(sys.executable))  # exe 所在目录，可写
+else:
+    SRC_DIR = os.path.join(SCRIPT_DIR, 'src')
+    DATA_DIR = SCRIPT_DIR
+
 sys.path.insert(0, SRC_DIR)  # 让 Python 找到 src/ 下的模块
 CLI_SCRIPT = os.path.join(SRC_DIR, 'generate_commission.py')
-CONFIG_PATH = os.path.join(SCRIPT_DIR, 'config.json')
-BACKUP_DIR = os.path.join(SCRIPT_DIR, 'backup')
-CARDS_DIR = os.path.join(SCRIPT_DIR, '个人绩效卡片')
+CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
+BACKUP_DIR = os.path.join(DATA_DIR, 'backup')
+CARDS_DIR = os.path.join(DATA_DIR, '个人绩效卡片')
+HISTORY_DIR = os.path.join(DATA_DIR, 'history')
 
 # 导入功能模块
 try:
@@ -32,7 +53,7 @@ except ImportError as e:
     print(f'features import error: {e}')
 
 # Python 解释器路径——启动时探测一次，之后缓存
-_CACHE_FILE = os.path.join(SCRIPT_DIR, '.python_cache')
+_CACHE_FILE = os.path.join(DATA_DIR, '.python_cache')
 def _find_python_with_openpyxl():
     # 读缓存
     if os.path.exists(_CACHE_FILE):
@@ -185,13 +206,13 @@ class App:
         self.app_settings = self.cfg.setdefault('app_settings', {})
 
         # 默认路径（若配置里有上次路径则优先恢复）
-        default_project = os.path.join(SCRIPT_DIR, 'data', '一组AI项目-8月.xlsx')
+        default_project = os.path.join(DATA_DIR, 'data', '一组AI项目-8月.xlsx')
         if not os.path.exists(default_project):
-            default_project = os.path.join(SCRIPT_DIR, '一组AI项目.xlsx')
-        default_template = os.path.join(SCRIPT_DIR, 'data', 'AI后期剪辑提成一组模板.xlsx')
+            default_project = os.path.join(DATA_DIR, '一组AI项目.xlsx')
+        default_template = os.path.join(DATA_DIR, 'data', 'AI后期剪辑提成一组模板.xlsx')
         if not os.path.exists(default_template):
-            default_template = os.path.join(SCRIPT_DIR, 'AI后期剪辑提成一组模板.xlsx')
-        default_output = os.path.join(SCRIPT_DIR, 'output')
+            default_template = os.path.join(DATA_DIR, 'AI后期剪辑提成一组模板.xlsx')
+        default_output = os.path.join(DATA_DIR, 'output')
         if not os.path.exists(default_output):
             os.makedirs(default_output, exist_ok=True)
 
@@ -229,6 +250,16 @@ class App:
                 self.root.after(2000, lambda: self._check_update(silent=True))
             except Exception:
                 pass
+        # 启动时检查自动备份是否到期
+        try:
+            self._check_auto_backup()
+        except Exception:
+            pass
+        # 启动定时生成检查器
+        try:
+            self._start_schedule_checker()
+        except Exception:
+            pass
 
     def _bind_hotkeys(self):
         """全局快捷键体系（扩展常用操作）"""
@@ -393,7 +424,7 @@ class App:
         f1 = filedialog.askopenfilename(
             title='选择第一组提成表',
             filetypes=[('Excel文件', '*.xlsx')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if not f1: return
         f2 = filedialog.askopenfilename(
             title='选择第二组提成表',
@@ -430,11 +461,528 @@ class App:
             self._log(f'❌ 对比失败: {e}')
             messagebox.showerror('失败', f'对比失败:\n{e}')
 
-    def _export_multi(self):
-        """多格式导出：导出人员提成/项目明细为 CSV 和 JSON"""
+    def _gen_trend_report(self):
+        """#1 跨月趋势：基于历史数据生成跨月收入/集数趋势 HTML"""
+        if not self._require_features(): return
+        try:
+            from features import generate_trend_report
+            html_path = generate_trend_report(HISTORY_DIR, self.output_dir)
+            if not html_path:
+                messagebox.showinfo('跨月趋势', 'history/ 目录暂无历史数据。\n请先点击"一键生成"至少一次以归档数据。', parent=self.root)
+                return
+            self._log(f'📈 已生成跨月趋势: {os.path.basename(html_path)}')
+            self._open(html_path)
+        except Exception as e:
+            self._log(f'❌ 跨月趋势失败: {e}')
+            messagebox.showerror('失败', f'生成跨月趋势失败:\n{e}', parent=self.root)
+
+    def _gen_annual_summary(self):
+        """#3 年度汇总：基于历史数据批量生成年度对比 Excel"""
+        if not self._require_features(): return
+        try:
+            from features import generate_annual_summary
+            excel_path = generate_annual_summary(HISTORY_DIR, self.output_dir)
+            if not excel_path:
+                messagebox.showinfo('年度汇总', 'history/ 目录暂无历史数据。\n请先点击"一键生成"至少一次以归档数据。', parent=self.root)
+                return
+            self._log(f'📅 已生成年度汇总: {os.path.basename(excel_path)}')
+            self._open(excel_path)
+        except Exception as e:
+            self._log(f'❌ 年度汇总失败: {e}')
+            messagebox.showerror('失败', f'生成年度汇总失败:\n{e}', parent=self.root)
+
+    def _interactive_ranking(self):
+        """#2 交互式绩效排名面板：Treeview 排序/筛选/TopN"""
+        if not self._require_features(): return
         try:
             import pandas as pd
-            from features import export_to_csv, export_to_json
+            gc, _sys = self._load_gc_module()
+            df = pd.read_excel(self.project_file, header=None)
+            records, group_pids = gc.parse_projects(df)
+            cd = gc.compute_commission(records, group_pids)
+            _sys.path.pop(0)
+        except Exception as e:
+            messagebox.showerror('排名失败', f'无法读取数据：{e}', parent=self.root)
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('🏅 交互式绩效排名')
+        dlg.geometry('820x560')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='🏅 交互式绩效排名（点击列头排序 · 可筛选）',
+                 font=('Microsoft YaHei', 14, 'bold'), bg=C['bg'],
+                 fg=C['text']).pack(pady=(12, 4))
+
+        # 筛选栏
+        fb = tk.Frame(dlg, bg=C['bg']); fb.pack(fill='x', padx=14, pady=(0, 6))
+        tk.Label(fb, text='角色:', font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack(side='left')
+        role_var = tk.StringVar(value='全部')
+        roles_all = ['全部'] + sorted(set(v for v in gc.ROLE_MAP.values()))
+        ttk.Combobox(fb, textvariable=role_var, values=roles_all, state='readonly',
+                     font=('Microsoft YaHei', 9), width=10).pack(side='left', padx=(4, 12))
+        tk.Label(fb, text='Top N:', font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack(side='left')
+        top_var = tk.StringVar(value='全部')
+        ttk.Combobox(fb, textvariable=top_var, values=['全部', '5', '10', '15', '20'],
+                     state='readonly', font=('Microsoft YaHei', 9), width=6).pack(side='left', padx=(4, 12))
+        self._btn(fb, '应用筛选', C['accent'], lambda: _refresh(), font_size=9, padx=12, pady=3).pack(side='left')
+
+        # 排名表
+        cols = ('rank', 'name', 'role', 'eps', 'comm', 'status')
+        tree = ttk.Treeview(dlg, columns=cols, show='headings')
+        for cid, txt, w in [('rank', '排名', 60), ('name', '姓名', 90), ('role', '角色', 90),
+                            ('eps', '集数', 80), ('comm', '提成', 100), ('status', '绩效', 60)]:
+            tree.heading(cid, text=txt, command=lambda c=cid: _sort_by(c))
+            tree.column(cid, width=w, anchor='center')
+        tree.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+
+        sort_col = 'comm'
+        sort_desc = True
+
+        def _get_rows():
+            rows = []
+            for nm, c in cd.items():
+                if role_var.get() != '全部' and c.get('role') != role_var.get():
+                    continue
+                rows.append((nm, c.get('role', ''), c.get('total_episodes', 0),
+                             c.get('total_commission', 0), c.get('is_complete', '')))
+            return rows
+
+        def _sort_by(col):
+            nonlocal sort_col, sort_desc
+            if sort_col == col:
+                sort_desc = not sort_desc
+            else:
+                sort_col = col
+                sort_desc = True
+            _refresh()
+
+        def _refresh():
+            for i in tree.get_children():
+                tree.delete(i)
+            rows = _get_rows()
+            key_idx = {'rank': None, 'name': 0, 'role': 1, 'eps': 2, 'comm': 3, 'status': 4}[sort_col]
+            if key_idx is not None:
+                rows.sort(key=lambda r: r[key_idx], reverse=sort_desc)
+            top = top_var.get()
+            if top != '全部':
+                rows = rows[:int(top)]
+            for i, r in enumerate(rows, 1):
+                tree.insert('', 'end', values=(i, r[0], r[1], r[2], r[3], r[4]))
+
+        _refresh()
+        self._btn(dlg, '关闭', C['gray'], dlg.destroy, font_size=9, padx=16, pady=4).pack(pady=(0, 10))
+
+    def _risk_warning(self):
+        """#4 异常/风险预警：扫描集数骤变/未达标/目标滞后等异常"""
+        if not self._require_features(): return
+        try:
+            import pandas as pd
+            from features import scan_anomalies
+            gc, _sys = self._load_gc_module()
+            df = pd.read_excel(self.project_file, header=None)
+            records, group_pids = gc.parse_projects(df)
+            cd = gc.compute_commission(records, group_pids)
+            _sys.path.pop(0)
+            goals = self.cfg.get('monthly_goals', {})
+            warnings = scan_anomalies(records, cd, HISTORY_DIR, goals)
+        except Exception as e:
+            messagebox.showerror('预警失败', f'扫描异常失败：{e}', parent=self.root)
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('⚠️ 风险预警')
+        dlg.geometry('760x480')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text=f'⚠️ 风险预警（发现 {len(warnings)} 项异常）',
+                 font=('Microsoft YaHei', 14, 'bold'), bg=C['bg'],
+                 fg=C['text']).pack(pady=(12, 4))
+        if not warnings:
+            tk.Label(dlg, text='✅ 未发现异常，一切正常。', font=('Microsoft YaHei', 12),
+                     bg=C['bg'], fg=C['green']).pack(pady=30)
+            self._btn(dlg, '关闭', C['gray'], dlg.destroy, font_size=9, padx=16, pady=4).pack(pady=(0, 10))
+            return
+        tree = ttk.Treeview(dlg, columns=('level', 'type', 'person', 'msg'), show='headings')
+        for cid, txt, w in [('level', '等级', 50), ('type', '类型', 90), ('person', '人员', 90), ('msg', '说明', 380)]:
+            tree.heading(cid, text=txt)
+            tree.column(cid, width=w, anchor='w')
+        color_map = {'高': '#e74c3c', '中': '#e67e22', '低': '#f1c40f'}
+        for w in warnings:
+            iid = tree.insert('', 'end', values=(w.get('level', ''), w.get('type', ''),
+                                                 w.get('person', ''), w.get('msg', '')))
+            tree.tag_configure(iid, foreground=color_map.get(w.get('level', ''), '#2c3e50'))
+        tree.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+        self._btn(dlg, '关闭', C['gray'], dlg.destroy, font_size=9, padx=16, pady=4).pack(pady=(0, 10))
+
+    def _manage_environments(self):
+        """#8 配置多环境：多套配置切换（不同团队各自环境），互不覆盖"""
+        from tkinter import simpledialog
+        try:
+            from config_loader import list_environments, load_environment, save_environment
+            from models import AppConfig
+        except Exception as e:
+            messagebox.showerror('环境切换', f'加载环境模块失败：{e}', parent=self.root)
+            return
+        envs = list_environments(CONFIG_PATH)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('🖥 配置环境切换')
+        dlg.geometry('460x380')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='🖥 配置环境切换', font=('Microsoft YaHei', 14, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 4))
+        tk.Label(dlg, text='不同团队/小组可各自保存一套配置，切换后互不覆盖。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack()
+
+        listbox = tk.Listbox(dlg, font=('Microsoft YaHei', 11), height=8)
+        listbox.pack(fill='both', expand=True, padx=16, pady=10)
+        for e in envs:
+            listbox.insert('end', e)
+        if envs:
+            listbox.selection_set(0)
+
+        def _switch():
+            sel = listbox.curselection()
+            if not sel: return
+            name = envs[sel[0]]
+            try:
+                new_cfg = load_environment(CONFIG_PATH, name).to_dict()
+                self.cfg.clear()
+                self.cfg.update(new_cfg)
+                # 保存当前环境名
+                self.cfg.setdefault('app_settings', {})['active_environment'] = name
+                try: self._save_config()
+                except Exception: pass
+                self._log(f'🖥 已切换到环境: {name}')
+                dlg.destroy()
+                messagebox.showinfo('环境切换', f'已切换到环境「{name}」。\n请重启软件后完全生效。', parent=self.root)
+            except Exception as e:
+                messagebox.showerror('切换失败', str(e), parent=self.root)
+
+        def _save_current():
+            name = simpledialog.askstring('保存环境', '输入环境名称（如：一组、二组）：', parent=dlg)
+            if not name: return
+            name = name.strip()
+            if not name: return
+            try:
+                save_environment(CONFIG_PATH, name, AppConfig.from_dict(self.cfg))
+                self.cfg.setdefault('app_settings', {})['active_environment'] = name
+                try: self._save_config()
+                except Exception: pass
+                self._log(f'🖥 已保存当前配置为环境: {name}')
+                messagebox.showinfo('保存环境', f'当前配置已保存为环境「{name}」。', parent=self.root)
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror('保存失败', str(e), parent=self.root)
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=16, pady=(0, 12))
+        self._btn(bf, '✅ 切换', C['green'], _switch, font_size=9, padx=14, pady=4).pack(side='left', padx=3)
+        self._btn(bf, '💾 保存当前', C['blue'], _save_current, font_size=9, padx=14, pady=4).pack(side='left', padx=3)
+        self._btn(bf, '❌ 关闭', C['gray'], dlg.destroy, font_size=9, padx=14, pady=4).pack(side='left', padx=3)
+
+    def _backup_policy(self):
+        """#9 数据备份自动策略：设置定时备份配置和历史数据"""
+        from tkinter import simpledialog
+        policy = self.cfg.setdefault('backup_policy', {'enabled': False, 'interval_days': 7, 'keep': 15})
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('🗄 备份策略')
+        dlg.geometry('460x360')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='🗄 数据备份自动策略', font=('Microsoft YaHei', 14, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 4))
+        tk.Label(dlg, text='定时自动备份 config.json 和历史数据，防止丢失。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack()
+
+        # 启用开关
+        enable_var = tk.BooleanVar(value=bool(policy.get('enabled')))
+        tk.Checkbutton(dlg, text='启用自动备份', variable=enable_var,
+                       font=('Microsoft YaHei', 11), bg=C['bg'], fg=C['text'],
+                       selectcolor=C['bg'], activebackground=C['bg']).pack(pady=(14, 4))
+
+        # 间隔天数
+        f1 = tk.Frame(dlg, bg=C['bg']); f1.pack(fill='x', padx=30, pady=4)
+        tk.Label(f1, text='备份间隔（天）:', font=('Microsoft YaHei', 10), bg=C['bg'],
+                 fg=C['text2']).pack(side='left')
+        interval_var = tk.StringVar(value=str(policy.get('interval_days', 7)))
+        tk.Spinbox(f1, from_=1, to=90, textvariable=interval_var, font=('Microsoft YaHei', 10),
+                   width=6, relief='solid', borderwidth=1).pack(side='left', padx=6)
+
+        # 保留份数
+        f2 = tk.Frame(dlg, bg=C['bg']); f2.pack(fill='x', padx=30, pady=4)
+        tk.Label(f2, text='保留份数:', font=('Microsoft YaHei', 10), bg=C['bg'],
+                 fg=C['text2']).pack(side='left')
+        keep_var = tk.StringVar(value=str(policy.get('keep', 15)))
+        tk.Spinbox(f2, from_=1, to=99, textvariable=keep_var, font=('Microsoft YaHei', 10),
+                   width=6, relief='solid', borderwidth=1).pack(side='left', padx=6)
+
+        # 目标目录
+        f3 = tk.Frame(dlg, bg=C['bg']); f3.pack(fill='x', padx=30, pady=4)
+        tk.Label(f3, text='备份目录:', font=('Microsoft YaHei', 10), bg=C['bg'],
+                 fg=C['text2']).pack(side='left')
+        target_var = tk.StringVar(value=policy.get('target_dir', os.path.join(DATA_DIR, 'backup')))
+        tk.Entry(f3, textvariable=target_var, font=('Microsoft YaHei', 9),
+                 relief='solid', borderwidth=1).pack(side='left', fill='x', expand=True, padx=6)
+        def _pick_dir():
+            d = filedialog.askdirectory(title='选择备份目录', initialdir=target_var.get())
+            if d: target_var.set(d)
+        self._btn(f3, '浏览', C['blue'], _pick_dir, font_size=8, padx=8, pady=2).pack(side='left')
+
+        def _save():
+            policy['enabled'] = enable_var.get()
+            try: policy['interval_days'] = int(interval_var.get())
+            except ValueError: pass
+            try: policy['keep'] = int(keep_var.get())
+            except ValueError: pass
+            policy['target_dir'] = target_var.get().strip() or os.path.join(DATA_DIR, 'backup')
+            self.cfg['backup_policy'] = policy
+            try: self._save_config()
+            except Exception: pass
+            self._log(f'🗄 备份策略已保存: {"启用" if policy["enabled"] else "停用"} 间隔{policy["interval_days"]}天 保留{policy["keep"]}份')
+            dlg.destroy()
+            messagebox.showinfo('备份策略', f'备份策略已保存。\n启用后每次启动若到期将自动备份。', parent=self.root)
+
+        # 立即备份按钮
+        def _backup_now():
+            try:
+                from features import auto_backup_config
+                target = target_var.get().strip() or os.path.join(DATA_DIR, 'backup')
+                created = auto_backup_config(CONFIG_PATH, HISTORY_DIR, target, int(keep_var.get() or 15))
+                self._log(f'🗄 已立即备份 {len(created)} 个文件到 {target}')
+                messagebox.showinfo('备份完成', f'已备份 {len(created)} 个文件到：\n{target}', parent=self.root)
+            except Exception as e:
+                messagebox.showerror('备份失败', str(e), parent=self.root)
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=20, pady=(16, 12))
+        self._btn(bf, '💾 保存策略', C['green'], _save, font_size=10, padx=14, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '⏱ 立即备份', C['blue'], _backup_now, font_size=9, padx=12, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '❌ 关闭', C['gray'], dlg.destroy, font_size=9, padx=12, pady=4).pack(side='left', padx=4)
+
+    def _check_auto_backup(self):
+        """启动时检查自动备份策略是否到期，若到期则自动备份"""
+        policy = self.cfg.get('backup_policy', {})
+        if not policy.get('enabled'):
+            return
+        try:
+            from features import auto_backup_config, backup_due
+            target = policy.get('target_dir') or os.path.join(DATA_DIR, 'backup')
+            last_str = policy.get('last_backup_time', '')
+            last = None
+            if last_str:
+                try:
+                    from datetime import datetime as _dt
+                    last = _dt.strptime(last_str, '%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    last = None
+            if backup_due(policy, last):
+                created = auto_backup_config(CONFIG_PATH, HISTORY_DIR, target,
+                                             int(policy.get('keep', 15)))
+                if created:
+                    from datetime import datetime as _dt
+                    policy['last_backup_time'] = _dt.now().strftime('%Y-%m-%d %H:%M:%S')
+                    self.cfg['backup_policy'] = policy
+                    try: self._save_config()
+                    except Exception: pass
+                    self._log(f'🗄 自动备份完成: {len(created)} 个文件 -> {target}')
+        except Exception as e:
+            self._log(f'⚠️ 自动备份检查失败: {e}')
+
+    def _schedule_setup(self):
+        """#10 报表定时生成：设置到点自动生成"""
+        schedule = self.cfg.setdefault('schedule', {'enabled': False, 'time': '18:00'})
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('⏰ 定时生成')
+        dlg.geometry('420x300')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='⏰ 报表定时生成', font=('Microsoft YaHei', 14, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 4))
+        tk.Label(dlg, text='软件运行期间，到设定时间自动生成提成表。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack()
+
+        enable_var = tk.BooleanVar(value=bool(schedule.get('enabled')))
+        tk.Checkbutton(dlg, text='启用定时生成', variable=enable_var,
+                       font=('Microsoft YaHei', 11), bg=C['bg'], fg=C['text'],
+                       selectcolor=C['bg'], activebackground=C['bg']).pack(pady=(14, 4))
+
+        f1 = tk.Frame(dlg, bg=C['bg']); f1.pack(fill='x', padx=30, pady=4)
+        tk.Label(f1, text='生成时间（HH:MM）:', font=('Microsoft YaHei', 10), bg=C['bg'],
+                 fg=C['text2']).pack(side='left')
+        time_var = tk.StringVar(value=schedule.get('time', '18:00'))
+        tk.Entry(f1, textvariable=time_var, font=('Microsoft YaHei', 11), width=8,
+                 relief='solid', borderwidth=1).pack(side='left', padx=6)
+
+        def _save():
+            schedule['enabled'] = enable_var.get()
+            schedule['time'] = time_var.get().strip() or '18:00'
+            self.cfg['schedule'] = schedule
+            try: self._save_config()
+            except Exception: pass
+            self._log(f'⏰ 定时生成已保存: {"启用" if schedule["enabled"] else "停用"} 时间{schedule["time"]}')
+            dlg.destroy()
+            messagebox.showinfo('定时生成', f'定时生成设置已保存。\n{"到点将自动生成。" if schedule["enabled"] else "已停用。"}', parent=self.root)
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=20, pady=(16, 12))
+        self._btn(bf, '💾 保存', C['green'], _save, font_size=10, padx=14, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '❌ 关闭', C['gray'], dlg.destroy, font_size=9, padx=12, pady=4).pack(side='left', padx=4)
+
+    def _data_encryption(self):
+        """K: 数据加密 —— 为配置文件设置密码保护"""
+        from tkinter import simpledialog
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('🔐 数据加密')
+        dlg.geometry('440x280')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='🔐 配置文件加密', font=('Microsoft YaHei', 14, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 4))
+        tk.Label(dlg, text='为 config.json 设置密码，防止他人查看真实人员数据。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack()
+
+        # 检测是否已加密
+        is_enc = False
+        try:
+            import json as _j
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as _f:
+                _raw = _j.load(_f)
+            is_enc = isinstance(_raw, dict) and _raw.get('__encrypted__')
+        except Exception:
+            pass
+        tk.Label(dlg, text='当前状态：' + ('🔒 已加密' if is_enc else '🔓 未加密'),
+                 font=('Microsoft YaHei', 10, 'bold'), bg=C['bg'],
+                 fg=C['green'] if not is_enc else C['amber']).pack(pady=(12, 6))
+
+        # 密码输入
+        f1 = tk.Frame(dlg, bg=C['bg']); f1.pack(fill='x', padx=30, pady=4)
+        tk.Label(f1, text='密码:', font=('Microsoft YaHei', 10), bg=C['bg'],
+                 fg=C['text2']).pack(side='left')
+        pwd_var = tk.StringVar()
+        tk.Entry(f1, textvariable=pwd_var, font=('Microsoft YaHei', 11), width=22,
+                 show='●', relief='solid', borderwidth=1).pack(side='left', padx=6)
+
+        def _encrypt():
+            pwd = pwd_var.get()
+            if not pwd:
+                messagebox.showwarning('提示', '请输入密码', parent=dlg); return
+            try:
+                from config_loader import save_config_encrypted
+                from models import AppConfig
+                # 当前 cfg 是明文（启动时已加载）
+                save_config_encrypted(AppConfig.from_dict(self.cfg), CONFIG_PATH, pwd)
+                self._log('🔐 配置已加密保存')
+                messagebox.showinfo('加密成功', '配置已加密。\n重启后需输入密码才能加载。', parent=dlg)
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror('加密失败', str(e), parent=dlg)
+
+        def _decrypt():
+            pwd = pwd_var.get()
+            try:
+                from config_loader import load_config_encrypted
+                cfg = load_config_encrypted(CONFIG_PATH, pwd)
+                # 解密后保存为明文
+                from config_loader import save_config
+                save_config(cfg, CONFIG_PATH)
+                self._log('🔓 配置已解密（明文保存）')
+                messagebox.showinfo('解密成功', '配置已解密为明文。', parent=dlg)
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror('解密失败', str(e), parent=dlg)
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=20, pady=(16, 12))
+        self._btn(bf, '🔒 加密', C['red'], _encrypt, font_size=10, padx=14, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '🔓 解密', C['blue'], _decrypt, font_size=10, padx=14, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '❌ 关闭', C['gray'], dlg.destroy, font_size=9, padx=12, pady=4).pack(side='left', padx=4)
+
+    def _config_migrate(self):
+        """L: 配置迁移向导 —— 从旧版 config 迁移到当前结构"""
+        try:
+            import json as _j
+            from config_loader import migrate_config
+            with open(CONFIG_PATH, 'r', encoding='utf-8') as _f:
+                raw = _j.load(_f)
+        except Exception as e:
+            messagebox.showerror('迁移失败', f'无法读取配置：{e}', parent=self.root)
+            return
+
+        migrated, changed = migrate_config(raw)
+        if not changed:
+            messagebox.showinfo('配置迁移', '✅ 当前配置已是新结构，无需迁移。', parent=self.root)
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('🔄 配置迁移')
+        dlg.geometry('480x320')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='🔄 配置迁移向导', font=('Microsoft YaHei', 14, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 4))
+        tk.Label(dlg, text='检测到旧版配置字段，迁移后将兼容新结构。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack()
+        tk.Label(dlg, text='\n'.join(f'• {k} → 新字段' for k in changed),
+                 font=('Microsoft YaHei', 10), bg=C['bg'], fg=C['amber'],
+                 justify='left').pack(pady=12)
+
+        def _do_migrate():
+            try:
+                # 备份旧配置
+                import shutil as _sh
+                bak = CONFIG_PATH + '.bak_premigrate'
+                if not os.path.exists(bak):
+                    _sh.copy2(CONFIG_PATH, bak)
+                # 保存迁移结果
+                from config_loader import save_config
+                from models import AppConfig
+                save_config(AppConfig.from_dict(migrated), CONFIG_PATH)
+                self._log(f'🔄 配置已迁移: {", ".join(changed)} -> 新字段')
+                messagebox.showinfo('迁移完成',
+                    f'✅ 配置已迁移到新结构！\n\n旧配置已备份为:\n{os.path.basename(bak)}',
+                    parent=self.root)
+                dlg.destroy()
+            except Exception as e:
+                messagebox.showerror('迁移失败', str(e), parent=self.root)
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=20, pady=(16, 12))
+        self._btn(bf, '✅ 执行迁移', C['green'], _do_migrate, font_size=10, padx=14, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '❌ 取消', C['gray'], dlg.destroy, font_size=9, padx=12, pady=4).pack(side='left', padx=4)
+
+    def _start_schedule_checker(self):
+        """启动定时生成检查器：每秒检查一次是否到点"""
+        schedule = self.cfg.get('schedule', {})
+        if not schedule.get('enabled'):
+            return
+        target = schedule.get('time', '18:00')
+        fired_today = [False]  # 同一天不重复触发
+
+        def _tick():
+            if not self.cfg.get('schedule', {}).get('enabled'):
+                return
+            try:
+                now = datetime.now()
+                cur_time = now.strftime('%H:%M')
+                if cur_time == target and not fired_today[0]:
+                    fired_today[0] = True
+                    self._log(f'⏰ 定时触发：到点 {target}，开始自动生成...')
+                    self._do_generate(self.project_file, self.output_dir, self.template_file, {})
+                elif cur_time != target:
+                    fired_today[0] = False  # 过了这个时间点，明天可再次触发
+            except Exception as e:
+                self._log(f'⚠️ 定时检查失败: {e}')
+            try:
+                self.root.after(30000, _tick)  # 每 30 秒检查一次
+            except Exception:
+                pass
+        self.root.after(30000, _tick)
+
+    def _export_multi(self):
+        """多格式导出：导出人员提成/项目明细为 CSV、JSON 和增强版"""
+        try:
+            from features import export_to_csv, export_to_json, export_enhanced
             gc, _sys = self._load_gc_module()
             df = pd.read_excel(self.project_file, header=None)
             records, group_pids = gc.parse_projects(df)
@@ -446,53 +994,80 @@ class App:
         out_dir = filedialog.askdirectory(title='选择导出目录', initialdir=self.output_dir)
         if not out_dir:
             return
-        try:
-            created_csv = export_to_csv(records, cd, out_dir)
-            created_json = export_to_json(records, cd, out_dir)
-            self._log(f'💾 已导出 {len(created_csv)} 个 CSV + {os.path.basename(created_json)}')
-            messagebox.showinfo('导出完成',
-                f'已导出到：\n{out_dir}\n\n'
-                f'CSV: {len(created_csv)} 个\n'
-                f'JSON: 1 个', parent=self.root)
-            self._open(out_dir)
-        except Exception as e:
-            self._log(f'❌ 导出失败: {e}')
-            messagebox.showerror('导出失败', str(e), parent=self.root)
+        # 选择导出选项
+        opt = tk.Toplevel(self.root)
+        opt.title('导出选项')
+        opt.geometry('400x240')
+        opt.configure(bg=C['bg'])
+        opt.transient(self.root); opt.grab_set()
+        tk.Label(opt, text='💾 选择导出方式', font=('Microsoft YaHei', 13, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(16, 6))
+        split_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt, text='按角色拆分 CSV（每个角色一个文件）', variable=split_var,
+                       font=('Microsoft YaHei', 10), bg=C['bg'], fg=C['text'],
+                       selectcolor=C['bg'], activebackground=C['bg']).pack(pady=4)
+        def _do_export():
+            try:
+                created_csv = export_to_csv(records, cd, out_dir)
+                created_json = export_to_json(records, cd, out_dir)
+                created_enh = export_enhanced(records, cd, out_dir, split_by_role=split_var.get())
+                total = len(created_csv) + len(created_enh)
+                opt.destroy()
+                self._log(f'💾 已导出 {total} 个文件到 {out_dir}')
+                messagebox.showinfo('导出完成',
+                    f'已导出到：\n{out_dir}\n\n'
+                    f'基础 CSV: {len(created_csv)} 个\n'
+                    f'增强 CSV/Excel: {len(created_enh)} 个\n'
+                    f'JSON: 1 个', parent=self.root)
+                self._open(out_dir)
+            except Exception as e:
+                self._log(f'❌ 导出失败: {e}')
+                messagebox.showerror('导出失败', str(e), parent=self.root)
+        bf = tk.Frame(opt, bg=C['bg']); bf.pack(fill='x', padx=20, pady=(16, 12))
+        self._btn(bf, '✅ 导出', C['green'], _do_export, font_size=10, padx=18, pady=5).pack(side='left', padx=6)
+        self._btn(bf, '❌ 取消', C['gray'], opt.destroy, font_size=9, padx=14, pady=4).pack(side='left', padx=6)
 
     def _import_data(self):
         """数据导入向导：选择 CSV/Excel，预览并追加到项目数据"""
         path = filedialog.askopenfilename(
             title='选择要导入的数据文件',
             filetypes=[('数据文件', '*.xlsx *.csv'), ('Excel', '*.xlsx'), ('CSV', '*.csv')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if not path:
             return
         try:
             import pandas as pd
+            from features import clean_import_data
             if path.lower().endswith('.csv'):
                 df_in = pd.read_csv(path, encoding='utf-8-sig')
             else:
                 df_in = pd.read_excel(path, header=None)
+            df_clean, clean_report = clean_import_data(df_in)
         except Exception as e:
             messagebox.showerror('导入失败', f'无法读取文件：{e}', parent=self.root)
             return
 
         dlg = tk.Toplevel(self.root)
         dlg.title('📥 数据导入预览')
-        dlg.geometry('760x480')
+        dlg.geometry('760x520')
         dlg.configure(bg=C['bg'])
         dlg.transient(self.root); dlg.grab_set()
         tk.Label(dlg, text=f'文件：{os.path.basename(path)} · 共 {len(df_in)} 行',
                  font=('Microsoft YaHei', 10, 'bold'), bg=C['bg'],
                  fg=C['text']).pack(padx=14, pady=(10, 4), anchor='w')
+        # 清洗报告
+        tk.Label(dlg, text='🧹 清洗结果：' + '；'.join(clean_report),
+                 font=('Microsoft YaHei', 8), bg=C['bg'],
+                 fg=C['green'] if '移除重复' not in '；'.join(clean_report) else C['amber'],
+                 wraplength=700, justify='left').pack(padx=14, anchor='w')
         tk.Label(dlg, text='预览前 10 行（确认格式后导入）：',
                  font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack(padx=14, anchor='w')
         preview = tk.Text(dlg, font=('Microsoft YaHei', 9), bg=C['log_bg'], fg=C['log_fg'],
                           relief='flat', padx=10, pady=8, height=12)
         preview.pack(fill='both', expand=True, padx=14, pady=(4, 8))
         lines = []
-        for i in range(min(10, len(df_in))):
-            row = [str(x) for x in df_in.iloc[i].tolist() if pd.notna(x)]
+        for i in range(min(10, len(df_clean))):
+            row = [str(x) for x in df_clean.iloc[i].tolist() if pd.notna(x)]
             lines.append(' | '.join(row))
         preview.insert('1.0', '\n'.join(lines) if lines else '（空文件）')
         preview.configure(state='disabled')
@@ -508,8 +1083,8 @@ class App:
                         last = r; break
                 next_row = last + 2
                 added = 0
-                for i in range(len(df_in)):
-                    vals = [df_in.iloc[i, j] for j in range(min(10, df_in.shape[1]))]
+                for i in range(len(df_clean)):
+                    vals = [df_clean.iloc[i, j] for j in range(min(10, df_clean.shape[1]))]
                     if all(pd.isna(v) for v in vals):
                         continue
                     for j, v in enumerate(vals):
@@ -528,6 +1103,341 @@ class App:
         bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=14, pady=(0, 10))
         self._btn(bf, '✅ 确认导入', C['green'], _do_import, font_size=9, padx=16, pady=4).pack(side='left', padx=3)
         self._btn(bf, '❌ 取消', C['gray'], dlg.destroy, font_size=9, padx=16, pady=4).pack(side='left', padx=3)
+
+    def _data_entry(self):
+        """#2 GUI数据录入：图形化录入项目数据，无需手动填 Excel"""
+        from datetime import datetime as _dt, timedelta as _td
+        names = sorted(self.cfg.get('人员角色', {}).keys())
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title('📝 数据录入')
+        dlg.geometry('860x620')
+        dlg.minsize(700, 500)
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+
+        # ---- 标题 ----
+        tk.Label(dlg, text='📝 图形化数据录入', font=('Microsoft YaHei', 15, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 2))
+        tk.Label(dlg, text='填写项目信息与人员分配，确认后自动写入项目数据（无需编辑Excel）。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack(pady=(0, 8))
+
+        # ---- 项目信息卡 ----
+        c1 = tk.Frame(dlg, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
+        c1.pack(fill='x', padx=14, pady=(0, 8))
+        tk.Label(c1, text='📋 项目信息', font=('Microsoft YaHei', 10, 'bold'),
+                 bg=C['card'], fg=C['text']).pack(anchor='w', padx=12, pady=(8, 4))
+        g1 = tk.Frame(c1, bg=C['card']); g1.pack(fill='x', padx=12)
+        tk.Label(g1, text='项目名称:', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).grid(row=0, column=0, sticky='w', pady=2)
+        proj_name_var = tk.StringVar()
+        tk.Entry(g1, textvariable=proj_name_var, font=('Microsoft YaHei', 10), width=32,
+                 relief='solid', borderwidth=1).grid(row=0, column=1, padx=6, pady=2)
+        tk.Label(g1, text='项目ID:', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).grid(row=0, column=2, sticky='w', padx=(12, 0), pady=2)
+        proj_id_var = tk.StringVar()
+        tk.Entry(g1, textvariable=proj_id_var, font=('Microsoft YaHei', 10), width=12,
+                 relief='solid', borderwidth=1).grid(row=0, column=3, padx=6, pady=2)
+        tk.Label(g1, text='交付日期:', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).grid(row=1, column=0, sticky='w', pady=2)
+        date_var = tk.StringVar(value='8.1下午18点交')
+        tk.Entry(g1, textvariable=date_var, font=('Microsoft YaHei', 10), width=16,
+                 relief='solid', borderwidth=1).grid(row=1, column=1, sticky='w', padx=6, pady=2)
+
+        # ---- 人员分配卡 ----
+        c2 = tk.Frame(dlg, bg=C['card'], highlightthickness=1, highlightbackground=C['border'])
+        c2.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+        hdr2 = tk.Frame(c2, bg=C['card']); hdr2.pack(fill='x', padx=12, pady=(8, 4))
+        tk.Label(hdr2, text='👥 人员分配', font=('Microsoft YaHei', 10, 'bold'),
+                 bg=C['card'], fg=C['text']).pack(side='left')
+        self._btn(hdr2, '➕ 添加分配行', C['blue'], lambda: _add_assign_row(), font_size=8, padx=10, pady=2).pack(side='right')
+
+        # 选人模版行（复用分集工具的 personnel_templates）
+        tpl_row = tk.Frame(c2, bg=C['card']); tpl_row.pack(fill='x', padx=12, pady=(0, 4))
+        tk.Label(tpl_row, text='📋 选人模版:', font=('Microsoft YaHei', 9), bg=C['card'],
+                 fg=C['text2']).pack(side='left', padx=(0, 4))
+        p_templates = self.cfg.get('personnel_templates', {})
+        tpl_var = tk.StringVar()
+        tpl_names = list(p_templates.keys())
+        tpl_combo = ttk.Combobox(tpl_row, textvariable=tpl_var, values=['（暂无模版）'] + tpl_names,
+                                 state='readonly', font=('Microsoft YaHei', 9), width=14)
+        tpl_combo.pack(side='left', padx=(0, 6))
+        if tpl_names:
+            tpl_combo.current(0)
+
+        def _load_tpl():
+            name = tpl_var.get()
+            if not name or name.startswith('（'):
+                messagebox.showwarning('提示', '请先在智能分集中保存选人模版', parent=dlg); return
+            if name not in p_templates:
+                messagebox.showwarning('提示', f'模版"{name}"不存在', parent=dlg); return
+            people = p_templates[name]
+            if not people:
+                messagebox.showwarning('提示', '该模版为空', parent=dlg); return
+            # 清除现有分配行（assign_rows 为 6 元组：name, f1, t1, f2, t2, frame）
+            for _, _, _, _, _, f in list(assign_rows):
+                f.destroy()
+            assign_rows.clear()
+            # 按模版创建分配行（集数留空待填）
+            for nm in people:
+                _add_assign_row(nm=nm)
+            self._log(f'📋 已按模版"{name}"创建 {len(people)} 行分配')
+        self._btn(tpl_row, '📥 加载', C['green'], _load_tpl, font_size=8, padx=10, pady=2).pack(side='left')
+
+        # 分配行容器（可滚动）
+        ac = tk.Frame(c2, bg=C['card'])
+        ac.pack(fill='both', expand=True, padx=12, pady=(0, 8))
+        acanvas = tk.Canvas(ac, bg=C['card'], highlightthickness=0, height=180)
+        asb = tk.Scrollbar(ac, orient='vertical', command=acanvas.yview)
+        ainner = tk.Frame(acanvas, bg=C['card'])
+        ainner.bind('<Configure>', lambda e: acanvas.configure(scrollregion=acanvas.bbox('all')))
+        awin = acanvas.create_window((0, 0), window=ainner, anchor='nw')
+        acanvas.configure(yscrollcommand=asb.set)
+        acanvas.pack(side='left', fill='both', expand=True)
+        asb.pack(side='right', fill='y')
+        def _aresize(e): acanvas.itemconfig(awin, width=e.width)
+        acanvas.bind('<Configure>', _aresize)
+
+        assign_rows = []  # [(name_var, from_var, to_var, from2_var, to2_var, frame)]
+
+        def _add_assign_row(nm='', frm='', to='', frm2='', to2=''):
+            row = tk.Frame(ainner, bg=C['card'])
+            row.pack(fill='x', pady=2)
+            nv = tk.StringVar(value=nm)
+            cb = ttk.Combobox(row, textvariable=nv, values=names, state='readonly',
+                              font=('Microsoft YaHei', 9), width=10)
+            cb.pack(side='left', padx=(0, 6))
+            # 第一段
+            tk.Label(row, text='从', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).pack(side='left')
+            fv = tk.StringVar(value=frm)
+            tk.Entry(row, textvariable=fv, font=('Microsoft YaHei', 9), width=5,
+                     relief='solid', borderwidth=1).pack(side='left', padx=3)
+            tk.Label(row, text='到', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).pack(side='left')
+            tv = tk.StringVar(value=to)
+            tk.Entry(row, textvariable=tv, font=('Microsoft YaHei', 9), width=5,
+                     relief='solid', borderwidth=1).pack(side='left', padx=3)
+            # 第二段（可不填）
+            tk.Label(row, text='｜', font=('Microsoft YaHei', 9, 'bold'), bg=C['card'],
+                     fg=C['text3']).pack(side='left', padx=(6, 0))
+            tk.Label(row, text='第二段', font=('Microsoft YaHei', 7), bg=C['card'],
+                     fg=C['text3']).pack(side='left', padx=(4, 2))
+            fv2 = tk.StringVar(value=frm2)
+            tk.Entry(row, textvariable=fv2, font=('Microsoft YaHei', 9), width=5,
+                     relief='solid', borderwidth=1).pack(side='left', padx=3)
+            tv2 = tk.StringVar(value=to2)
+            tk.Entry(row, textvariable=tv2, font=('Microsoft YaHei', 9), width=5,
+                     relief='solid', borderwidth=1).pack(side='left', padx=3)
+            tk.Label(row, text='集', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).pack(side='left', padx=(0, 8))
+            def _del_row(r=row):
+                r.destroy()
+                assign_rows[:] = [x for x in assign_rows if x[5] is not r]
+            tk.Button(row, text='✕', font=('Microsoft YaHei', 8, 'bold'), bg=C['red'], fg='white',
+                      relief='flat', cursor='hand2', padx=6, pady=0, command=_del_row).pack(side='left')
+            assign_rows.append((nv, fv, tv, fv2, tv2, row))
+
+        # 默认加 3 行
+        _add_assign_row()
+        _add_assign_row()
+        _add_assign_row()
+
+        # ---- 写入逻辑 ----
+        def _save():
+            proj_name = proj_name_var.get().strip()
+            proj_id = proj_id_var.get().strip()
+            date_str = date_var.get().strip()
+            if not proj_name or not proj_id:
+                messagebox.showwarning('提示', '请填写项目名称和项目ID', parent=dlg); return
+            # 收集分配行（支持两段不连续区间）
+            assigns = []
+            for nv, fv, tv, fv2, tv2, _ in assign_rows:
+                nm = nv.get().strip()
+                if not nm: continue
+                try:
+                    f = int(fv.get()); t = int(tv.get())
+                except (ValueError, TypeError):
+                    messagebox.showwarning('提示', f'"{nm}" 的第一段集数范围格式不正确', parent=dlg); return
+                if f < 1 or t < f:
+                    messagebox.showwarning('提示', f'"{nm}" 的第一段集数范围无效（{f}-{t}）', parent=dlg); return
+                # 第二段（可选）
+                seg2 = None
+                f2s, t2s = fv2.get().strip(), tv2.get().strip()
+                if f2s or t2s:
+                    try:
+                        f2 = int(f2s); t2 = int(t2s)
+                    except (ValueError, TypeError):
+                        messagebox.showwarning('提示', f'"{nm}" 的第二段集数范围格式不正确', parent=dlg); return
+                    if f2 < 1 or t2 < f2:
+                        messagebox.showwarning('提示', f'"{nm}" 的第二段集数范围无效（{f2}-{t2}）', parent=dlg); return
+                    seg2 = (f2, t2)
+                assigns.append((nm, f, t, seg2))
+            if not assigns:
+                messagebox.showwarning('提示', '请至少添加一条人员分配', parent=dlg); return
+
+            # #7 前置校验：人员重复 / 区间重叠 / 单行两段重叠
+            seen_person = set()
+            for nm, f, t, seg2 in assigns:
+                if nm in seen_person:
+                    messagebox.showwarning('校验提示', f'人员"{nm}"出现了多次，请合并为一行', parent=dlg); return
+                seen_person.add(nm)
+                if seg2:
+                    f2, t2 = seg2
+                    if not (t < f2 or t2 < f):
+                        messagebox.showwarning('校验提示',
+                            f'"{nm}" 的两段区间重叠（{f}-{t} 与 {f2}-{t2}）', parent=dlg); return
+            # 不同人员之间的区间重叠
+            for i in range(len(assigns)):
+                nm1, f1, t1, seg2_1 = assigns[i]
+                segs1 = [(f1, t1)] + ([seg2_1] if seg2_1 else [])
+                for j in range(i + 1, len(assigns)):
+                    nm2, f2, t2, seg2_2 = assigns[j]
+                    segs2 = [(f2, t2)] + ([seg2_2] if seg2_2 else [])
+                    for (a1, b1) in segs1:
+                        for (a2, b2) in segs2:
+                            if not (b1 < a2 or b2 < a1):
+                                messagebox.showwarning('校验提示',
+                                    f'集数区间重叠："{nm1}"（{a1}-{b1}）与 "{nm2}"（{a2}-{b2}）', parent=dlg); return
+            try:
+                from openpyxl import load_workbook
+                from openpyxl.styles import Font, Alignment
+                wb = load_workbook(self.project_file)
+                ws = wb.active
+                # 找到末尾
+                last = ws.max_row
+                for r in range(last, 0, -1):
+                    if ws.cell(r, 1).value or ws.cell(r, 3).value:
+                        last = r; break
+                next_row = last + 2  # 空一行
+                # 项目标题行
+                dir_label = f'O:\\AI漫剧剪辑一组\\{proj_name}'
+                font_title = Font(name='宋体', size=14, bold=True)
+                font_normal = Font(name='宋体', size=14)
+                align_center = Alignment(horizontal='center', vertical='center')
+                ws.cell(next_row, 1, proj_name).font = font_title
+                ws.cell(next_row, 2, dir_label).font = font_title
+                ws.cell(next_row, 4, date_str).font = font_title
+                ws.cell(next_row, 5, '已分集').font = font_title
+                # 人员分配行（支持两段：1-30，45-60）
+                for item in assigns:
+                    nm, f, t, seg2 = item
+                    if f != t:
+                        eps_text = f'{f}-{t}'
+                    else:
+                        eps_text = str(f)
+                    if seg2:
+                        f2, t2 = seg2
+                        eps_text += '，' + (f'{f2}-{t2}' if f2 != t2 else str(f2))
+                    ws.cell(next_row, 3, f'{nm}：{eps_text}').font = font_normal
+                    next_row += 1
+                wb.save(self.project_file)
+                wb.close()
+                self._log(f'📝 已录入项目"{proj_name}"（{len(assigns)}人分配）')
+                dlg.destroy()
+                messagebox.showinfo('录入完成',
+                    f'✅ 项目"{proj_name}"已写入项目数据。\n'
+                    f'共 {len(assigns)} 条人员分配。\n\n'
+                    f'可用「数据预览」或"一键生成"核对。', parent=self.root)
+            except Exception as e:
+                messagebox.showerror('录入失败', f'写入失败：{e}', parent=self.root)
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=14, pady=(0, 12))
+        self._btn(bf, '✅ 写入项目数据', C['green'], _save, font_size=11, padx=18, pady=5).pack(side='left', padx=3)
+        self._btn(bf, '❌ 取消', C['gray'], dlg.destroy, font_size=9, padx=14, pady=4).pack(side='left', padx=3)
+
+    def _all_tools(self):
+        """返回所有可收藏功能列表：[(名称, 图标, 方法)]"""
+        return [
+            ('数据预览', '📋', self._preview_data),
+            ('数据校验', '✅', self._validate_data),
+            ('智能分集', '📐', self._smart_assign),
+            ('数据录入', '📝', self._data_entry),
+            ('批量处理', '📦', self._batch_process),
+            ('交互排名', '🏅', self._interactive_ranking),
+            ('统计图表', '📈', self._gen_charts),
+            ('跨月趋势', '📈', self._gen_trend_report),
+            ('年度汇总', '📅', self._gen_annual_summary),
+            ('多格式导出', '💾', self._export_multi),
+            ('数据导入', '📥', self._import_data),
+            ('月度目标', '🎯', self._monthly_goals),
+            ('备份策略', '🗄', self._backup_policy),
+            ('定时生成', '⏰', self._schedule_setup),
+            ('数据加密', '🔐', self._data_encryption),
+            ('配置迁移', '🔄', self._config_migrate),
+            ('风险预警', '⚠️', self._risk_warning),
+            ('环境切换', '🖥', self._manage_environments),
+            ('月份对比', '📊', self._compare_months),
+            ('组内排名', '🏆', self._gen_ranking),
+            ('项目管理', '🗂', self._gen_project_mgmt),
+            ('绩效卡片', '🃏', self._gen_cards),
+            ('数据修正', '✏', self._data_correction),
+            ('Web服务', '🌐', self._web_server),
+            ('高级筛选', '🔎', self._advanced_filter),
+            ('下月模板', '📅', self._gen_next_template),
+        ]
+
+    def _refresh_favorites_bar(self):
+        """刷新顶部收藏快捷按钮栏"""
+        for w in self.fav_bar.winfo_children():
+            w.destroy()
+        favs = self.cfg.get('favorites', [])
+        if not favs:
+            tk.Label(self.fav_bar, text='⭐ 点击右上角收藏常用功能，快速直达',
+                     font=('Microsoft YaHei', 8), bg=C['bg'], fg=C['text3']).pack(side='left', padx=4)
+            return
+        tk.Label(self.fav_bar, text='⭐ 快捷:', font=('Microsoft YaHei', 8, 'bold'),
+                 bg=C['bg'], fg=C['text2']).pack(side='left', padx=(0, 4))
+        tools_map = {name: (icon, fn) for name, icon, fn in self._all_tools()}
+        for name in favs:
+            if name not in tools_map:
+                continue
+            icon, fn = tools_map[name]
+            b = self._btn(self.fav_bar, f'{icon} {name}', C['accent'], fn, font_size=8, padx=10, pady=3)
+            b.pack(side='left', padx=2)
+
+    def _manage_favorites(self):
+        """⭐ 常用操作收藏管理：勾选收藏，保存到 config"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title('⭐ 常用操作收藏')
+        dlg.geometry('420x480')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root); dlg.grab_set()
+        tk.Label(dlg, text='⭐ 常用操作收藏', font=('Microsoft YaHei', 14, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(12, 4))
+        tk.Label(dlg, text='勾选常用功能，将显示在顶部快捷栏。',
+                 font=('Microsoft YaHei', 9), bg=C['bg'], fg=C['text2']).pack()
+
+        current = set(self.cfg.get('favorites', []))
+        tools = self._all_tools()
+
+        sf = tk.Frame(dlg, bg=C['bg']); sf.pack(fill='both', expand=True, padx=16, pady=8)
+        canvas = tk.Canvas(sf, bg=C['bg'], highlightthickness=0)
+        sbar = tk.Scrollbar(sf, orient='vertical', command=canvas.yview)
+        inner = tk.Frame(canvas, bg=C['bg'])
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        wid = canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=sbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        sbar.pack(side='right', fill='y')
+        def _resize(e): canvas.itemconfig(wid, width=e.width)
+        canvas.bind('<Configure>', _resize)
+
+        vars_ = {}
+        for name, icon, _ in tools:
+            v = tk.BooleanVar(value=name in current)
+            vars_[name] = v
+            tk.Checkbutton(inner, text=f'{icon} {name}', variable=v,
+                           font=('Microsoft YaHei', 10), bg=C['bg'], fg=C['text'],
+                           selectcolor=C['bg'], activebackground=C['bg'],
+                           anchor='w').pack(fill='x', padx=8, pady=1)
+
+        def _save():
+            selected = [n for n, v in vars_.items() if v.get()]
+            self.cfg['favorites'] = selected
+            try: self._save_config()
+            except Exception: pass
+            self._refresh_favorites_bar()
+            self._log(f'⭐ 已保存 {len(selected)} 个收藏')
+            dlg.destroy()
+
+        bf = tk.Frame(dlg, bg=C['bg']); bf.pack(fill='x', padx=16, pady=(0, 12))
+        self._btn(bf, '💾 保存收藏', C['green'], _save, font_size=10, padx=14, pady=4).pack(side='left', padx=4)
+        self._btn(bf, '❌ 关闭', C['gray'], dlg.destroy, font_size=9, padx=12, pady=4).pack(side='left', padx=4)
 
     def _monthly_goals(self):
         """月度目标设定与跟踪：为每人设定集数/收入目标，保存到 config.json"""
@@ -623,7 +1533,10 @@ class App:
             listbox.delete(0, 'end')
             for nm in names:
                 t = proj_templates.get(nm, {})
-                listbox.insert('end', f'{nm}  (总集数:{t.get("total","")} 一卡区间:{t.get("range","")})')
+                roles_str = ''
+                if t.get('roles'):
+                    roles_str = ' 配比:' + ','.join(f'{k}{v}' for k, v in t['roles'].items())
+                listbox.insert('end', f'{nm}  (总集数:{t.get("total","")} 一卡区间:{t.get("range","")}{roles_str})')
         _refresh_list()
 
         def _add():
@@ -636,6 +1549,19 @@ class App:
             rng = simpledialog.askinteger('新增模板', '一卡区间（可留空）：', parent=tdlg, minvalue=1)
             t = {'total': total}
             if rng: t['range'] = rng
+            # 角色配比：格式如 "小组长:1, 一卡剪辑:3"
+            roles_str = simpledialog.askstring('新增模板', '角色配比（可留空，格式：角色:人数, 角色:人数）\n例：小组长:1, 一卡剪辑:3', parent=tdlg)
+            if roles_str:
+                roles = {}
+                for part in roles_str.replace('，', ',').split(','):
+                    part = part.strip()
+                    if ':' in part:
+                        rname, cnt = part.split(':', 1)
+                        rname = rname.strip()
+                        try: roles[rname] = int(cnt.strip())
+                        except ValueError: pass
+                if roles:
+                    t['roles'] = roles
             proj_templates[name] = t
             names.append(name)
             self.cfg['project_templates'] = proj_templates
@@ -670,7 +1596,7 @@ class App:
         try:
             latest = None
             # 1) 本地 version.txt（内网/共享文件夹场景）
-            local_v = os.path.join(SCRIPT_DIR, 'version.txt')
+            local_v = os.path.join(DATA_DIR, 'version.txt')
             if os.path.exists(local_v):
                 with open(local_v, 'r', encoding='utf-8') as f:
                     latest = f.read().strip()
@@ -688,6 +1614,16 @@ class App:
                     latest = None
             if latest and latest != cur:
                 self._log(f'🆕 发现新版本 v{latest}（当前 v{cur}）')
+                # J: 若配置了 update_url 则支持直接下载更新
+                update_url = self.cfg.get('update_url', '')
+                if update_url:
+                    do_up = messagebox.askyesno(
+                        '发现新版本',
+                        f'发现新版本 v{latest}（当前 v{cur}）\n\n是否立即下载并更新？',
+                        parent=self.root)
+                    if do_up:
+                        self._download_update(update_url)
+                        return
                 messagebox.showinfo('发现新版本',
                                      f'发现新版本 v{latest}（当前 v{cur}）\n\n请前往下载或联系管理员更新。',
                                      parent=self.root)
@@ -700,18 +1636,73 @@ class App:
                 messagebox.showerror('检查失败', f'无法检查更新：{e}', parent=self.root)
             self._log(f'⚠️ 更新检查失败: {e}')
 
+    def _download_update(self, url):
+        """J: 下载新版本文件并替换当前程序文件"""
+        import urllib.request
+        try:
+            self._log(f'⬇️ 正在下载更新: {url}')
+            tmp = os.path.join(DATA_DIR, '_update_tmp.py')
+            req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, 'wb') as f:
+                f.write(resp.read())
+            self._log(f'✅ 下载完成，正在替换...')
+            # 备份当前文件后替换
+            cur_file = os.path.abspath(__file__)
+            bak = cur_file + '.bak_update'
+            try:
+                if os.path.exists(bak):
+                    os.remove(bak)
+                os.rename(cur_file, bak)
+            except OSError:
+                pass
+            os.replace(tmp, cur_file)
+            messagebox.showinfo('更新完成',
+                f'✅ 已更新到新版本！\n\n请重启软件生效。\n（旧版本已备份为 .bak_update）',
+                parent=self.root)
+            self._log(f'✅ 更新完成，请重启软件')
+        except Exception as e:
+            self._log(f'❌ 更新失败: {e}')
+            messagebox.showerror('更新失败', f'下载或替换失败：\n{e}', parent=self.root)
+            try:
+                if os.path.exists(tmp := os.path.join(DATA_DIR, '_update_tmp.py')):
+                    os.remove(tmp)
+            except OSError:
+                pass
+
     def _batch_process(self):
-        """批量处理：选择多个数据文件，逐个生成提成表"""
+        """批量处理：选择多个数据文件，逐个生成提成表（带进度条/停止/失败重试）"""
         files = filedialog.askopenfilenames(
             title='选择多个数据文件（可多选）',
             filetypes=[('Excel文件', '*.xlsx')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if not files:
             return
         self._log(f'📦 批量处理：选中 {len(files)} 个数据文件')
+
+        # 进度对话框
+        dlg = tk.Toplevel(self.root)
+        dlg.title('📦 批量处理进度')
+        dlg.geometry('420x200')
+        dlg.configure(bg=C['bg'])
+        dlg.transient(self.root)
+        tk.Label(dlg, text='📦 批量处理中...', font=('Microsoft YaHei', 12, 'bold'),
+                 bg=C['bg'], fg=C['text']).pack(pady=(14, 6))
+        self._batch_progress = ttk.Progressbar(dlg, mode='determinate', maximum=len(files))
+        self._batch_progress.pack(fill='x', padx=24, pady=6)
+        self._batch_status = tk.Label(dlg, text='准备开始...', font=('Microsoft YaHei', 9),
+                                      bg=C['bg'], fg=C['text2'])
+        self._batch_status.pack(pady=4)
+        stop_flag = [False]
+        tk.Button(dlg, text='⏹ 停止', font=('Microsoft YaHei', 10), bg=C['red'], fg='white',
+                  relief='flat', cursor='hand2', padx=16, pady=4,
+                  command=lambda: stop_flag.__setitem__(0, True)).pack(pady=(10, 8))
+
         def worker():
-            ok = 0
+            ok, failed = 0, []
+            total = len(files)
             for i, pf in enumerate(files):
+                if stop_flag[0]:
+                    break
                 try:
                     gc, _sys = self._load_gc_module()
                     import pandas as pd
@@ -725,18 +1716,55 @@ class App:
                         gc.TEMPLATE_DATE = f'{_yr}年{data_mnum:02d}月'
                     records, group_pids = gc.parse_projects(df)
                     if not records:
-                        self.root.after(0, lambda p=pf, i=i: self._log(f'  ⚠️ [{i+1}/{len(files)}] {os.path.basename(p)} 无有效记录，跳过'))
-                        continue
-                    cd = gc.compute_commission(records, group_pids)
-                    out = os.path.join(self.output_dir, f'AI后期剪辑提成一组{gc.OUTPUT_MONTH}.xlsx')
-                    gc.generate_excel(records, cd, self.template_file, out)
-                    _sys.path.pop(0)
-                    ok += 1
-                    self.root.after(0, lambda p=pf, i=i, n=len(files): self._log(f'  ✅ [{i+1}/{n}] {os.path.basename(p)} 已生成'))
+                        self.root.after(0, lambda p=pf, i=i, n=total: self._log(f'  ⚠️ [{i+1}/{n}] {os.path.basename(p)} 无有效记录，跳过'))
+                    else:
+                        cd = gc.compute_commission(records, group_pids)
+                        out = os.path.join(self.output_dir, f'AI后期剪辑提成一组{gc.OUTPUT_MONTH}.xlsx')
+                        gc.generate_excel(records, cd, self.template_file, out)
+                        _sys.path.pop(0)
+                        ok += 1
+                        self.root.after(0, lambda p=pf, i=i, n=total: self._log(f'  ✅ [{i+1}/{n}] {os.path.basename(p)} 已生成'))
                 except Exception as e:
-                    self.root.after(0, lambda p=pf, e=e, i=i: self._log(f'  ❌ [{i+1}/{len(files)}] {os.path.basename(p)} 失败: {e}'))
-            self.root.after(0, lambda: self._log(f'📦 批量完成：成功 {ok} 个，失败 {len(files)-ok} 个'))
-            self.root.after(0, lambda: self._open(self.output_dir))
+                    failed.append((pf, e))
+                    self.root.after(0, lambda p=pf, e=e, i=i, n=total: self._log(f'  ❌ [{i+1}/{n}] {os.path.basename(p)} 失败: {e}'))
+                self.root.after(0, lambda i=i: (self._batch_progress.configure(value=i + 1),
+                                                self._batch_status.configure(text=f'已完成 {i+1}/{total}')))
+
+            # H: 失败自动重试一次
+            if failed and not stop_flag[0]:
+                self.root.after(0, lambda: self._log(f'🔁 对 {len(failed)} 个失败文件重试一次...'))
+                retry_ok = 0
+                for pf, _ in failed:
+                    try:
+                        gc, _sys = self._load_gc_module()
+                        import pandas as pd
+                        df = pd.read_excel(pf, header=None)
+                        data_cn, data_mnum = gc.get_month_from_data(df)
+                        if data_cn and data_mnum:
+                            import re as _re
+                            _tm = _re.match(r'(\d{4})年', gc.TEMPLATE_DATE)
+                            _yr = _tm.group(1) if _tm else str(datetime.now().year)
+                            gc.OUTPUT_MONTH = data_cn
+                            gc.TEMPLATE_DATE = f'{_yr}年{data_mnum:02d}月'
+                        records, group_pids = gc.parse_projects(df)
+                        if records:
+                            cd = gc.compute_commission(records, group_pids)
+                            out = os.path.join(self.output_dir, f'AI后期剪辑提成一组{gc.OUTPUT_MONTH}.xlsx')
+                            gc.generate_excel(records, cd, self.template_file, out)
+                            _sys.path.pop(0)
+                            retry_ok += 1
+                            self.root.after(0, lambda p=pf: self._log(f'  ✅ 重试成功: {os.path.basename(p)}'))
+                    except Exception as e2:
+                        self.root.after(0, lambda p=pf, e2=e2: self._log(f'  ❌ 重试仍失败: {os.path.basename(p)} - {e2}'))
+                ok += retry_ok
+
+            def _done():
+                self._batch_progress.configure(value=total)
+                self._batch_status.configure(text=f'完成：成功 {ok} 个，失败 {total-ok} 个' + ('（已停止）' if stop_flag[0] else ''))
+                dlg.after(1200, dlg.destroy)
+                self._log(f'📦 批量完成：成功 {ok} 个，失败 {total-ok} 个' + ('（已停止）' if stop_flag[0] else ''))
+                self._open(self.output_dir)
+            self.root.after(0, _done)
         threading.Thread(target=worker, daemon=True).start()
 
     def _setup_ttk_style(self):
@@ -913,6 +1941,9 @@ class App:
         role_btn = self._btn(actions, '⚙', '#234846', self.open_role_editor, padx=12, pady=7)
         role_btn.pack(side='left', padx=3)
         self._tooltip(role_btn, '管理人员角色')
+        fav_btn = self._btn(actions, '⭐', '#234846', self._manage_favorites, padx=12, pady=7)
+        fav_btn.pack(side='left', padx=3)
+        self._tooltip(fav_btn, '常用操作收藏')
         # 日期显示
         from datetime import datetime as _dt
         _today = _dt.now()
@@ -945,6 +1976,11 @@ class App:
         content = tk.Frame(main, bg=C['bg'])
         content.pack(side='left', fill='both', expand=True)
         self._content_frames = {}  # name -> frame
+
+        # 收藏快捷栏（顶部）
+        self.fav_bar = tk.Frame(content, bg=C['bg'])
+        self.fav_bar.pack(fill='x', padx=10, pady=(8, 0))
+        self._refresh_favorites_bar()
 
         def _make_nav(i, icon, name, builder):
             # 内容页
@@ -1150,12 +2186,16 @@ class App:
                 ('✅','数据校验', C['green'], self._validate_data, '校验项目数据日期、人名、重复分配等问题'),
                 ('🔍','项目去重', C['red'], self._check_duplicates, '检查相同项目ID是否对应了不同项目名称'),
                 ('📐','智能分集', C['pink'], self._smart_assign, '按角色权重自动分配各人负责集数'),
+                ('📝','数据录入', C['blue'], self._data_entry, '图形化录入项目数据，无需手动填Excel'),
                 ('📦','批量处理', C['indigo'], self._batch_process, '选择多个数据文件批量生成提成表'),
+                ('🏅','交互排名', C['amber'], self._interactive_ranking, '交互式排序/筛选的绩效排名面板'),
             ]),
             ('📈 报表生成', [
                 ('📊','月份对比', C['orange'], self._compare_months, '选择两个月提成表对比集数和提成变化'),
                 ('📈','统计图表', C['cyan'], self._gen_charts, '可视化收入趋势、集数柱状与项目分布'),
                 ('👥','多组对比', C['teal'], self._compare_groups, '对比两个组/团队的集数与提成差异'),
+                ('📈','跨月趋势', C['indigo'], self._gen_trend_report, '基于历史数据生成跨月收入/集数趋势'),
+                ('📅','年度汇总', C['purple'], self._gen_annual_summary, '批量汇总各月数据生成年度对比表'),
                 ('🏆','组内排名', C['amber'], self._gen_ranking, '生成月度集数排行和提成排行HTML'),
                 ('🗂','项目管理', C['purple'], self._gen_project_mgmt, '生成项目清单视图按交付日期排序'),
                 ('🃏','绩效卡片', C['blue'], self._gen_cards, '每人独立HTML绩效卡片含集数达标提成'),
@@ -1165,8 +2205,10 @@ class App:
                 ('📤','导出PDF', C['cyan'], self._export_pdf, '将Excel提成表导出为A3横版PDF'),
                 ('💾','多格式导出', C['teal'], self._export_multi, '导出人员提成/项目明细为CSV和JSON'),
                 ('📥','数据导入', C['blue'], self._import_data, '从CSV/Excel导入数据并映射列名'),
+                ('🗄','备份策略', C['slate'], self._backup_policy, '设置定时自动备份配置和历史数据'),
                 ('🏷','提成规则', C['slate'], self._edit_rules, '可视化编辑各角色的基准集数单价'),
                 ('📥','模板下载', C['teal'], self._download_template, '下载标准化项目数据录入模板Excel'),
+                ('🔄','配置迁移', C['indigo'], self._config_migrate, '从旧版配置迁移到当前结构'),
             ]),
             ('⚡ 高级工具', [
                 ('🎯','月度目标', C['amber'], self._monthly_goals, '为每人设定集数/收入目标并跟踪进度'),
@@ -1176,6 +2218,10 @@ class App:
                 ('📸','配置快照', C['purple'], self._config_snapshot, '保存配置历史支持一键回滚'),
                 ('🔄','文件监控', C['green'], self._toggle_watch, '检测数据变化自动提示重新生成'),
                 ('🆕','更新检查', C['cyan'], self._check_update, '检查版本更新并提示下载'),
+                ('⚠️','风险预警', C['red'], self._risk_warning, '扫描集数骤变/未达标/目标滞后等异常'),
+                ('🖥','环境切换', C['teal'], self._manage_environments, '多套配置切换（不同团队各自环境）'),
+                ('⏰','定时生成', C['cyan'], self._schedule_setup, '到点自动生成报表'),
+                ('🔐','数据加密', C['slate'], self._data_encryption, '为配置文件设置密码保护'),
             ]),
         ]
 
@@ -1448,7 +2494,7 @@ class App:
         path = filedialog.askopenfilename(
             title='选择项目数据文件',
             filetypes=[('Excel文件', '*.xlsx'), ('所有文件', '*.*')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if path:
             self.project_file = path
             self._save_app_settings()
@@ -1459,7 +2505,7 @@ class App:
         path = filedialog.askopenfilename(
             title='选择模板文件',
             filetypes=[('Excel文件', '*.xlsx'), ('所有文件', '*.*')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if path:
             self.template_file = path
             self._save_app_settings()
@@ -1512,7 +2558,7 @@ class App:
         path = filedialog.askopenfilename(
             title='选择要导出的Excel提成表',
             filetypes=[('Excel文件', '*.xlsx')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if not path:
             return
         self._log(f'📤 正在导出PDF: {os.path.basename(path)}')
@@ -1557,7 +2603,7 @@ class App:
         f1 = filedialog.askopenfilename(
             title='选择第一个月份的提成表',
             filetypes=[('Excel文件', '*.xlsx')],
-            initialdir=SCRIPT_DIR)
+            initialdir=DATA_DIR)
         if not f1: return
         f2 = filedialog.askopenfilename(
             title='选择第二个月份的提成表',
@@ -1794,7 +2840,7 @@ class App:
             import traceback
             msg = traceback.format_exc()
             # 同时写文件，方便完整查看
-            with open(os.path.join(SCRIPT_DIR, '_smart_assign_error.txt'), 'w', encoding='utf-8') as f:
+            with open(os.path.join(DATA_DIR, '_smart_assign_error.txt'), 'w', encoding='utf-8') as f:
                 f.write(msg)
             # 只显示前 500 字符
             short = msg[:600] + ('...' if len(msg) > 600 else '')
@@ -1829,6 +2875,8 @@ class App:
         btn_assign.pack(side='left', padx=3, fill='x', expand=True)
         btn_reroll = _mk_btn(btn_bar, '🔄 再次随机', '#d97706', '#b45309', lambda: None, 12, False)
         btn_reroll.pack(side='left', padx=3, fill='x', expand=True)
+        btn_restore = _mk_btn(btn_bar, '↩️ 恢复上次', '#7c3aed', '#6d28d9', lambda: None, 12, False)
+        btn_restore.pack(side='left', padx=3, fill='x', expand=True)
         btn_confirm = _mk_btn(btn_bar, '✅ 确认入库', '#16a34a', '#15803d', lambda: None, 12, False)
         btn_confirm.pack(side='left', padx=3, fill='x', expand=True)
         btn_confirm.configure(state='disabled')
@@ -2036,6 +3084,26 @@ class App:
                 col += 1
                 if col >= 2: col = 0; row += 1
 
+        # 增强模板套用：按角色配比自动勾选人员
+        def _apply_tpl_roles(_e=None):
+            name = tpl_var.get()
+            if name not in proj_templates:
+                return
+            t = proj_templates[name]
+            roles_cfg = t.get('roles')
+            if not roles_cfg:
+                return
+            # 先清空，再按配比勾选（每个角色勾选前 N 人）
+            for v in check_vars.values():
+                v.set(False)
+            for rname, cnt in roles_cfg.items():
+                matched = [nm for nm in check_vars if roles_map.get(nm, '') == rname
+                           or (rname == '小组长' and '小组长' in roles_map.get(nm, ''))
+                           or (rname == '一卡剪辑' and '一卡' in roles_map.get(nm, '') and '小组长' not in roles_map.get(nm, ''))]
+                for nm in matched[:cnt]:
+                    check_vars[nm].set(True)
+        tpl_combo.bind('<<ComboboxSelected>>', lambda e: (_apply_tpl(e), _apply_tpl_roles(e)))
+
         # ---- 右栏：结果预览 + 编辑 ----
         right = tk.Frame(paned, bg=C['bg']); paned.add(right, minsize=360)
 
@@ -2225,11 +3293,44 @@ class App:
                 f = tk.Frame(add_row, bg=C['card']); f.pack(side='left')
                 ri['spin_from'] = tk.IntVar(value=1); ri['spin_to'] = tk.IntVar(value=1)
                 tk.Label(f, text='从', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).pack(side='left')
-                tk.Spinbox(f, from_=1, to=total, textvariable=ri['spin_from'], font=('Microsoft YaHei', 10),
-                           width=5, relief='solid', borderwidth=1, justify='center').pack(side='left', padx=3)
+                sp_from = tk.Spinbox(f, from_=1, to=total, textvariable=ri['spin_from'], font=('Microsoft YaHei', 10),
+                           width=5, relief='solid', borderwidth=1, justify='center')
+                sp_from.pack(side='left', padx=3)
+                ri['sp_from'] = sp_from
                 tk.Label(f, text='到', font=('Microsoft YaHei', 9), bg=C['card'], fg=C['text2']).pack(side='left')
-                tk.Spinbox(f, from_=1, to=total, textvariable=ri['spin_to'], font=('Microsoft YaHei', 10),
-                           width=5, relief='solid', borderwidth=1, justify='center').pack(side='left', padx=3)
+                sp_to = tk.Spinbox(f, from_=1, to=total, textvariable=ri['spin_to'], font=('Microsoft YaHei', 10),
+                           width=5, relief='solid', borderwidth=1, justify='center')
+                sp_to.pack(side='left', padx=3)
+                ri['sp_to'] = sp_to
+
+                # #4 区间冲突实时提示：输入变化时检查与其他行的重叠
+                def _mk_check(r):
+                    def _check(*_a):
+                        try:
+                            s = int(r['spin_from'].get()); e = int(r['spin_to'].get())
+                        except (ValueError, TypeError):
+                            return
+                        if not (1 <= s <= total and 1 <= e <= total) or s > e:
+                            for sp in (r.get('sp_from'), r.get('sp_to')):
+                                if sp: sp.configure(highlightbackground='#e53e3e', highlightthickness=2)
+                            return
+                        # 检查是否与其他行的区间冲突
+                        conflict = False
+                        new_set = set(range(s, e + 1))
+                        for other in rows:
+                            if other is r: continue
+                            for (a, b) in other['ranges']:
+                                if set(range(a, b + 1)) & new_set:
+                                    conflict = True; break
+                            if conflict: break
+                        color = '#e53e3e' if conflict else '#dce6e5'
+                        for sp in (r.get('sp_from'), r.get('sp_to')):
+                            if sp:
+                                sp.configure(highlightbackground=color, highlightthickness=2 if conflict else 1)
+                    return _check
+                ri['spin_from'].trace_add('write', _mk_check(ri))
+                ri['spin_to'].trace_add('write', _mk_check(ri))
+
                 tk.Button(f, text='添加', font=('Microsoft YaHei', 9), bg=C['green'], fg='white', relief='flat',
                           cursor='hand2', padx=10, pady=1, command=lambda r=ri: _do_add(r, total)).pack(side='left', padx=4)
                 rows.append(ri)
@@ -2257,8 +3358,9 @@ class App:
             _display_result(result, name)
             _build_edit_rows(total)
             btn_confirm.configure(state='normal')
-            # 记住设置
+            # 记住设置（含分集结果区间，供"恢复上次"使用）
             sa['name'] = name; sa['eps'] = total; sa['range'] = rng; sa['selected'] = selected
+            sa['assignments'] = {k: [list(x) for x in v] for k, v in result['assignments'].items()}
             self.cfg.setdefault('app_settings', {})['smart_assign'] = sa
             self._save_config()
             self._log(f'🎲 已生成分集结果（{total}集 / {len(selected)}人）')
@@ -2268,6 +3370,46 @@ class App:
             except Exception as e:
                 import traceback; msg = traceback.format_exc()
                 messagebox.showerror('分集出错', msg, parent=dlg)
+
+        def _restore_last():
+            """#3 恢复上次分集结果（人员、总集数、区间）"""
+            try:
+                if not sa.get('assignments'):
+                    messagebox.showinfo('恢复上次', '暂无上次分集记录。\n请先进行一次随机分集。', parent=dlg)
+                    return
+                # 恢复项目名/总集数/区间
+                if sa.get('name'):
+                    name_var.set(sa['name'])
+                if sa.get('eps'):
+                    eps_var.set(int(sa['eps']))
+                if sa.get('range'):
+                    range_var.set(int(sa['range']))
+                # 恢复勾选人员
+                saved_sel = sa.get('selected', [])
+                for v in check_vars.values():
+                    v.set(False)
+                for nm in saved_sel:
+                    if nm in check_vars:
+                        check_vars[nm].set(True)
+                # 恢复分集结果
+                last_result[0] = {'assignments': {k: [tuple(x) for x in v] for k, v in sa['assignments'].items()},
+                                   'formatted': {}, 'summary': {}}
+                last_selected_list[:] = [n for n in saved_sel if n in check_vars]
+                # 构造 formatted 用于显示
+                fmt = {}
+                for k, v in sa['assignments'].items():
+                    parts = []
+                    for s, e in v:
+                        parts.append(f'{s}-{e}' if s != e else str(s))
+                    fmt[k] = '，'.join(parts)
+                last_result[0]['formatted'] = fmt
+                _display_result(last_result[0], sa.get('name', ''))
+                _build_edit_rows(eps_var.get())
+                btn_confirm.configure(state='normal')
+                self._log(f'↩️ 已恢复上次分集结果（{len(last_selected_list)}人 / {sa.get("eps","")}集）')
+            except Exception as e:
+                import traceback
+                messagebox.showerror('恢复失败', f'{e}\n\n{traceback.format_exc()}', parent=dlg)
 
         def _confirm():
             try:
@@ -2299,6 +3441,7 @@ class App:
         # 绑定主按钮
         btn_assign.configure(command=_do_assign_common)
         btn_reroll.configure(command=_do_assign_common)
+        btn_restore.configure(command=_restore_last)
         btn_confirm.configure(command=_confirm)
 
     def _check_duplicates(self):
@@ -2778,7 +3921,7 @@ class App:
     # ============ 功能8：配置快照与回滚 ============
     def _config_snapshot(self):
         if not self._require_features(): return
-        snap_dir = os.path.join(SCRIPT_DIR, 'config_snapshots')
+        snap_dir = os.path.join(DATA_DIR, 'config_snapshots')
         snapshots = list_config_snapshots(snap_dir)
 
         dlg = tk.Toplevel(self.root)
@@ -2873,6 +4016,14 @@ class App:
             return
 
         try:
+            # 生成只读看板页（供主管在线查看）
+            try:
+                from features import generate_readonly_dashboard
+                ro = generate_readonly_dashboard(HISTORY_DIR, self.output_dir)
+                if ro:
+                    self._log(f'📊 只读看板已生成: {os.path.basename(ro)}')
+            except Exception as roe:
+                self._log(f'⚠️ 只读看板生成跳过: {roe}')
             self._web_server_instance = start_web_server(self.output_dir, 8080)
             port = self._web_server_instance.server_address[1]
             self._log(f'🌐 Web仪表盘已启动: http://localhost:{port}')
@@ -3261,7 +4412,7 @@ class App:
         dlg.protocol('WM_DELETE_WINDOW', lambda: [dlg.destroy(), self._done()])
 
     def _do_generate(self, project_file, output_dir, template_file, overtime_data):
-        """实际执行生成：用 CLI 脚本生成提成表"""
+        """实际执行生成：进程内直接调用生成引擎（无需外部 Python 子进程，支持打包成 exe）"""
         self.run_btn.configure(state='disabled', bg=C['gray'], text='⏳ 生成中...')
         self.st.configure(text='⏳ 正在计算绩效和生成表格...')
         self.progress.start(10)
@@ -3273,53 +4424,35 @@ class App:
             str(pid): set(episodes) for pid, episodes in overtime_data.items()
         }
 
-        with tempfile.NamedTemporaryFile(
-                mode='w', encoding='utf-8', suffix='.json',
-                prefix='overtime_', dir=SCRIPT_DIR, delete=False) as temp_file:
-            json.dump(overtime_data, temp_file, ensure_ascii=False, indent=2)
-            overtime_file = temp_file.name
-
         gc, gc_sys = self._load_gc_module()
         _, template_date = gc.get_month_from_template(template_file)
         year_match = re.match(r'(\d{4})年', template_date)
         self._generation_year = int(year_match.group(1)) if year_match else None
-        gc_sys.path.pop(0)
 
         def worker():
             try:
-                env = os.environ.copy()
-                env['PYTHONIOENCODING'] = 'utf-8'
-                if 'PYTHONPATH' in env:
-                    env['PYTHONPATH'] = SRC_DIR + os.pathsep + env['PYTHONPATH']
-                else:
-                    env['PYTHONPATH'] = SRC_DIR
-                self._log(f'  子进程 Python: {PYTHON_EXE}')
-                p = subprocess.Popen([PYTHON_EXE, CLI_SCRIPT,
-                                      project_file, template_file,
-                                      output_dir, '--overtime-file', overtime_file],
-                                     cwd=SCRIPT_DIR,
-                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True,
-                                     encoding='utf-8', errors='replace',
-                                     env=env)
-                try: p.stdin.write('\n'); p.stdin.flush()
-                except: pass
-                for ln in iter(p.stdout.readline, ''):
-                    line = ln.strip()
-                    if line.startswith('OUTPUT_EXCEL='):
-                        self._output_files['excel'] = line.split('=', 1)[1]
-                    elif line.startswith('OUTPUT_HTML='):
-                        self._output_files['html'] = line.split('=', 1)[1]
-                    self.root.after(0, lambda l=ln: self._filter_line(l))
-                p.wait()
+                def _log_line(line):
+                    try:
+                        self.root.after(0, lambda l=line: self._filter_line(l))
+                    except Exception:
+                        pass
+
+                final_path, html_path = gc.generate_in_process(
+                    project_file, template_file, output_dir,
+                    overtime_data=overtime_data,
+                    log=_log_line,
+                )
+                self._output_files['excel'] = final_path
+                self._output_files['html'] = html_path
                 self.root.after(0, self._done)
             except Exception as e:
                 self.root.after(0, lambda: self._log(f'❌ 错误: {e}'))
                 self.root.after(0, self._done)
             finally:
                 try:
-                    os.unlink(overtime_file)
-                except OSError:
+                    if gc_sys is not None and SRC_DIR in gc_sys.path:
+                        gc_sys.path.remove(SRC_DIR)
+                except Exception:
                     pass
 
         threading.Thread(target=worker, daemon=True).start()
@@ -3329,8 +4462,10 @@ class App:
         self.run_btn.configure(state='normal', bg=C['green'], text='▶  一键生成提成表')
         self._log('—' * 50)
 
-        excel_path = self._output_files.get('excel', '')
-        html_path = self._output_files.get('html', '')
+        # 取消/关闭超时对话框也可能触发 _done()，此时尚未初始化 _output_files，需容错
+        output_files = getattr(self, '_output_files', None) or {}
+        excel_path = output_files.get('excel', '')
+        html_path = output_files.get('html', '')
 
         excel_ok = excel_path and os.path.exists(excel_path)
         html_ok = html_path and os.path.exists(html_path)
@@ -3365,6 +4500,14 @@ class App:
                     if card_paths:
                         self._log(f'🃏 已生成 {len(card_paths)-1} 张个人绩效卡片 -> 个人绩效卡片/')
                         self._open(card_paths[0])
+                    # 自动归档到历史数据库（跨月趋势用）
+                    try:
+                        from features import archive_history
+                        month_label = gc.TEMPLATE_DATE
+                        archive_history(records, cd, HISTORY_DIR, month_label)
+                        self._log(f'🗂 已归档历史数据: {month_label} -> history/')
+                    except Exception as ae:
+                        self._log(f'⚠️ 历史归档跳过: {ae}')
                     _sys.path.pop(0)
                 except Exception as e:
                     self._log(f'⚠️ 卡片生成跳过: {e}')
@@ -3384,6 +4527,36 @@ class App:
 def main():
     root = tk.Tk()
     App(root)
+    # 覆盖 tkinter 默认异常上报：
+    # 1) 打包成无控制台 exe 时，默认会尝试写入无效 stderr，导致 OSError[Errno 22]；
+    # 2) 若用弹窗提示，遇到周期性回调反复报错会"无限弹窗"。
+    # 因此：完整错误写入日志文件，弹窗最多提示一次（防止死循环弹窗）。
+    _shown = {'once': False}
+
+    def _report_exc(exc, val, tb):
+        try:
+            import traceback as _tb
+            try:
+                data_dir = globals().get('DATA_DIR') or os.path.dirname(os.path.abspath(__file__))
+                log_path = os.path.join(data_dir, '错误日志.txt')
+                with open(log_path, 'a', encoding='utf-8') as f:
+                    f.write(f'\n[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] {val}\n')
+                    f.write(''.join(_tb.format_exception(exc, val, tb)))
+            except Exception:
+                pass
+            if not _shown['once']:
+                _shown['once'] = True
+                try:
+                    messagebox.showerror('程序错误',
+                                         f'程序发生异常：\n{val}\n\n完整错误已写入 错误日志.txt')
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    try:
+        root.report_callback_exception = _report_exc
+    except Exception:
+        pass
     root.mainloop()
 
 if __name__ == '__main__':
